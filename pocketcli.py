@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-pocketcli - Terminal UI for Pocket Casts
+pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.18.0"
-BUILD   = "2026-06-04"
+VERSION = "1.4.3"
+BUILD   = "2026-06-05"
 
 import os
 import sys
@@ -114,7 +114,7 @@ class API:
                 url_el = item.find("enclosure")
                 url   = url_el.get("url", "") if url_el is not None else ""
 
-                # Duration from itunes:duration
+                # Duracion desde itunes:duration
                 dur_str = item.findtext("itunes:duration", "", ns).strip()
                 duration = 0
                 if dur_str:
@@ -129,7 +129,7 @@ class API:
                     except Exception:
                         pass
 
-                # Date
+                # Fecha
                 pub_iso = ""
                 if pub:
                     try:
@@ -138,7 +138,7 @@ class API:
                     except Exception:
                         pub_iso = pub[:10]
 
-                # Description - strip HTML tags
+                # Descripcion - limpiar HTML tags
                 desc_raw = (
                     item.findtext("itunes:summary", "", ns) or
                     item.findtext("description", "") or ""
@@ -167,9 +167,12 @@ class API:
         except Exception:
             return []
 
-    def podcast_episodes(self, podcast_uuid, podcast_title=""):
+    def podcast_episodes(self, podcast_uuid, podcast_title="", feed_url=None):
         """Fetch episodes from RSS feed, crossing with in_progress by title"""
-        feed_url = self.podcast_feed_url(podcast_title)
+        # Use the feed URL from the podcast listing first (most accurate)
+        # Fall back to iTunes search only if not available
+        if not feed_url:
+            feed_url = self.podcast_feed_url(podcast_title)
         if not feed_url:
             return self._post("/user/podcast/episodes", {
                 "uuid": podcast_uuid, "page": 0, "sort": 3,
@@ -199,6 +202,29 @@ class API:
 
     def starred(self):
         return self._post("/user/starred").get("episodes", [])
+
+    def search_podcasts(self, query):
+        """Search podcasts via iTunes Search API"""
+        try:
+            import urllib.parse
+            term = urllib.parse.quote(query)
+            r = httpx.get(
+                f"https://itunes.apple.com/search?term={term}&entity=podcast&limit=15",
+                timeout=10,
+            )
+            results = r.json().get("results", [])
+            return [
+                {
+                    "uuid": str(p.get("collectionId", "")),
+                    "title": p.get("collectionName", ""),
+                    "author": p.get("artistName", ""),
+                    "feedUrl": p.get("feedUrl", ""),
+                    "artworkUrl": p.get("artworkUrl60", ""),
+                }
+                for p in results
+            ]
+        except Exception:
+            return []
 
     def files(self):
         return self._get("/files?include_bookmarks=true").get("files", [])
@@ -277,7 +303,7 @@ class MPV:
             cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        # connect socket
+        # conectar socket
         for _ in range(20):
             try:
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -325,6 +351,12 @@ class MPV:
     def get_paused(self):    return self._cmd(["get_property", "pause"]) or False
     def get_speed(self):     return self._cmd(["get_property", "speed"]) or 1.0
     def is_done(self):       return self._cmd(["get_property", "idle-active"]) is True
+    def get_chapter(self):   return self._cmd(["get_property", "chapter"]) or 0
+    def get_chapter_list(self):
+        data = self._cmd(["get_property", "chapter-list"])
+        return data if isinstance(data, list) else []
+    def next_chapter(self):  self._cmd(["add", "chapter", 1])
+    def prev_chapter(self):  self._cmd(["add", "chapter", -1])
 
     def pause_toggle(self):  self._cmd(["cycle", "pause"])
     def seek(self, secs):    self._cmd(["seek", secs, "relative"])
@@ -399,7 +431,7 @@ def curses_login(stdscr):
     curses.noecho()
     password = stdscr.getstr(h // 2 + 1, (w - 30) // 2 + 10, 50).decode()
 
-    stdscr.addstr(h // 2 + 3, (w - 30) // 2, "Authenticating...")
+    stdscr.addstr(h // 2 + 3, (w - 30) // 2, "Autenticando...")
     stdscr.refresh()
 
     try:
@@ -424,7 +456,7 @@ def curses_login(stdscr):
 # ─────────────────────────────────────────────
 
 class PocketTUI:
-    # Views
+    # Vistas
     VIEW_PODCASTS  = "podcasts"
     VIEW_EPISODES  = "episodes"
     VIEW_QUEUE     = "queue"     # in_progress / new / starred
@@ -438,7 +470,7 @@ class PocketTUI:
         self.api = api
         self.mpv = MPV()
 
-        # Navigation state
+        # Estado navegacion
         self.view          = self.VIEW_PODCASTS
         self.podcasts      = []
         self.episodes      = []
@@ -453,57 +485,129 @@ class PocketTUI:
         self.ep_offset     = 0
         self.q_offset      = 0
         self.f_offset      = 0
-        self.current_pod   = None  # active podcast dict
+        self.current_pod   = None  # dict podcast activo
 
-        # Player state
-        self.playing_ep     = None  # current episode dict
+        # Estado player
+        self.playing_ep     = None  # dict episodio
         self.playing_pod    = None  # current podcast dict
-        self.speed_idx      = 2     # 1.0x por default
+        self.speed_idx      = 2     # 1.0x default
         self.skip_silence   = 0     # 0=off 1=normal 2=medium 3=aggressive
         self.last_sync      = 0
         self.status_msg     = ""
         self.status_timer   = 0
-        self.show_desc      = False  # overlay de descripcion
+        self.show_desc      = False  # description overlay
+        self.desc_offset    = 0      # scroll position in desc overlay
+        self.show_keys      = False  # keymap overlay
+
+        # Search state
+        self.searching      = False  # search mode active
+        self.search_query   = ""     # current query string
+        self.search_results = []     # filtered episode results (episode search)
+        self.search_cursor  = 0
+        self.search_offset  = 0
+        self.pod_search_results = []  # podcast search results
+        self.pod_search_cursor  = 0
+        self.pod_search_offset  = 0
+        self.show_themes        = False
+        self.theme_cursor       = 0
+
+        # Theme definitions: (accent, active, info, selection_fg, selection_bg, header_fg, header_bg, error, sub)
+        self.THEMES = [
+            ("Default",        curses.COLOR_CYAN,    curses.COLOR_GREEN,   curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_CYAN,    curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_MAGENTA),
+            ("Dracula",        curses.COLOR_MAGENTA, curses.COLOR_GREEN,   curses.COLOR_CYAN,   curses.COLOR_BLACK, curses.COLOR_MAGENTA, curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_CYAN),
+            ("Nord",           curses.COLOR_CYAN,    curses.COLOR_BLUE,    curses.COLOR_WHITE,  curses.COLOR_BLACK, curses.COLOR_CYAN,    curses.COLOR_BLUE,  curses.COLOR_BLUE,   curses.COLOR_RED,    curses.COLOR_WHITE),
+            ("Gruvbox",        curses.COLOR_YELLOW,  curses.COLOR_GREEN,   curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_YELLOW,  curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_MAGENTA),
+            ("Solarized Dark", curses.COLOR_CYAN,    curses.COLOR_GREEN,   curses.COLOR_BLUE,   curses.COLOR_BLACK, curses.COLOR_CYAN,    curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_YELLOW),
+            ("Monokai",        curses.COLOR_GREEN,   curses.COLOR_MAGENTA, curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_GREEN,   curses.COLOR_BLACK, curses.COLOR_MAGENTA,curses.COLOR_RED,    curses.COLOR_CYAN),
+            ("Catppuccin",     curses.COLOR_MAGENTA, curses.COLOR_CYAN,    curses.COLOR_BLUE,   curses.COLOR_BLACK, curses.COLOR_MAGENTA, curses.COLOR_BLACK, curses.COLOR_CYAN,   curses.COLOR_RED,    curses.COLOR_WHITE),
+            ("Tokyo Night",    curses.COLOR_BLUE,    curses.COLOR_MAGENTA, curses.COLOR_CYAN,   curses.COLOR_BLACK, curses.COLOR_BLUE,    curses.COLOR_BLACK, curses.COLOR_MAGENTA,curses.COLOR_RED,    curses.COLOR_CYAN),
+            ("Everforest",     curses.COLOR_GREEN,   curses.COLOR_GREEN,   curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_GREEN,   curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_YELLOW),
+            ("Rosé Pine",      curses.COLOR_MAGENTA, curses.COLOR_CYAN,    curses.COLOR_WHITE,  curses.COLOR_BLACK, curses.COLOR_MAGENTA, curses.COLOR_BLACK, curses.COLOR_CYAN,   curses.COLOR_RED,    curses.COLOR_WHITE),
+        ]
+        self.current_theme = 0
 
         # Colors
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN,    -1)  # title
-        curses.init_pair(2, curses.COLOR_GREEN,   -1)  # activo / play
-        curses.init_pair(3, curses.COLOR_YELLOW,  -1)  # info / pos
-        curses.init_pair(4, curses.COLOR_WHITE,   -1)  # normal
-        curses.init_pair(5, curses.COLOR_BLACK,   curses.COLOR_CYAN)   # seleccion
-        curses.init_pair(6, curses.COLOR_BLACK,   curses.COLOR_GREEN)  # player bar
-        curses.init_pair(7, curses.COLOR_RED,     -1)  # error
-        curses.init_pair(8, curses.COLOR_MAGENTA, -1)  # subtitle
+        self._apply_theme(0)
 
         curses.curs_set(0)
         self.scr.nodelay(True)
         self.scr.keypad(True)
 
+    def _apply_theme(self, idx):
+        t    = self.THEMES[idx]
+        name, accent, active, info, sel_fg, sel_bg, hdr_fg, hdr_bg, error, sub = t
+        curses.init_pair(1, accent,              -1)       # title / accent
+        curses.init_pair(2, active,              -1)       # active / play
+        curses.init_pair(3, info,                -1)       # info / secondary
+        curses.init_pair(4, curses.COLOR_WHITE,  -1)       # normal text
+        curses.init_pair(5, sel_fg,              sel_bg)   # selection
+        curses.init_pair(6, hdr_fg,              hdr_bg)   # header bar
+        curses.init_pair(7, error,               -1)       # error
+        curses.init_pair(8, sub,                 -1)       # subtitle / chapter
+
     # ── Data loading ──────────────────────────
 
     def load_podcasts(self):
         self.status("Loading podcasts...")
-        try:
-            self.podcasts = self.api.subscribed_podcasts()
-            self.podcasts.sort(key=lambda p: p.get("title", "").lower())
-            self.status("")
-        except Exception as e:
-            self.status(f"Error: {e}", error=True)
+        def _load():
+            try:
+                pods = self.api.subscribed_podcasts()
+                pods.sort(key=lambda p: p.get("title", "").lower())
+                self.podcasts = pods
+                self.status("")
+            except Exception as e:
+                self.status(f"Error: {e}", error=True)
+        threading.Thread(target=_load, daemon=True).start()
 
     def load_episodes(self, podcast):
         self.current_pod = podcast
+        self.view        = self.VIEW_EPISODES
+        self.episodes    = []
+        self.ep_cursor   = 0
+        self.ep_offset   = 0
         self.status(f"Loading {podcast.get('title', '')}...")
-        try:
-            self.episodes = self.api.podcast_episodes(
-                podcast["uuid"], podcast.get("title", "")
-            )
-            self.ep_cursor = 0
-            self.ep_offset = 0
-            self.status(f"Loaded {len(self.episodes)} episodes")
-        except Exception as e:
-            self.status(f"Error loading episodes: {e}", error=True)
+
+        # Generation counter - if user navigates away, discard stale results
+        self._load_gen = getattr(self, "_load_gen", 0) + 1
+        gen = self._load_gen
+
+        def _load():
+            try:
+                feed_url = podcast.get("url") or podcast.get("feedUrl") or None
+
+                # Check before expensive iTunes lookup
+                if gen != self._load_gen:
+                    return
+
+                eps = self.api.podcast_episodes(
+                    podcast["uuid"], podcast.get("title", ""), feed_url=feed_url
+                )
+
+                if gen != self._load_gen:
+                    return
+
+                if not eps and feed_url:
+                    eps = self.api.podcast_episodes(
+                        podcast["uuid"], podcast.get("title", ""), feed_url=None
+                    )
+
+                if gen != self._load_gen:
+                    return
+
+                self.episodes  = eps
+                self.ep_cursor = 0
+                self.ep_offset = 0
+                if not self.episodes:
+                    self.status("No episodes found. Feed may not be publicly available.", error=True)
+                else:
+                    self.status(f"Loaded {len(self.episodes)} episodes")
+            except Exception as e:
+                if gen == self._load_gen:
+                    self.status(f"Error loading episodes: {e}", error=True)
+
+        threading.Thread(target=_load, daemon=True).start()
 
     def load_queue(self):
         self.status("Loading...")
@@ -541,7 +645,7 @@ class PocketTUI:
                 )
             self.mpv.quit()
 
-        # Wrap file as episode with special podcast_uuid
+        # Wrap file como episodio con podcast_uuid especial
         self.playing_pod = {"uuid": "__files__", "title": "Files"}
         self.playing_ep  = file_dict
         self.status("Fetching stream...")
@@ -564,7 +668,7 @@ class PocketTUI:
             return
 
         self.last_sync = time.time()
-        self.status(f"Playing: {file_dict.get('title', '')[:50]}")
+        self.status(f"Reproduciendo: {file_dict.get('title', '')[:50]}")
 
     def play(self, podcast_dict, episode_dict):
         # Detener lo que haya
@@ -597,7 +701,7 @@ class PocketTUI:
             return
 
         self.last_sync = time.time()
-        self.status(f"Playing: {episode_dict.get('title', '')[:50]}")
+        self.status(f"Reproduciendo: {episode_dict.get('title', '')[:50]}")
 
     def sync_position(self):
         if not self.mpv.is_running():
@@ -606,24 +710,26 @@ class PocketTUI:
             return
         now = time.time()
         if now - self.last_sync >= 30:
+            self.last_sync = now
             pos = self.mpv.get_position()
-            if self.playing_pod["uuid"] == "__files__":
-                # sync for files via different endpoint
+            pod = self.playing_pod
+            ep  = self.playing_ep
+            # Run in background thread to avoid blocking UI
+            def _sync():
                 try:
-                    self.api._post(f"/files/{self.playing_ep['uuid']}", {
-                        "playedUpTo": int(pos),
-                        "playingStatus": 2,
-                    })
+                    if pod["uuid"] == "__files__":
+                        self.api._post(f"/files/{ep['uuid']}", {
+                            "playedUpTo": int(pos),
+                            "playingStatus": 2,
+                        })
+                    else:
+                        self.api.update_position(pod["uuid"], ep["uuid"], pos)
                 except Exception:
                     pass
-            else:
-                self.api.update_position(
-                    self.playing_pod["uuid"], self.playing_ep["uuid"], pos
-                )
-            self.last_sync = now
+            threading.Thread(target=_sync, daemon=True).start()
 
     def check_finished(self):
-        # Only clear if mpv was running and finished, no si nunca arranco
+        # Solo limpiar si mpv estuvo corriendo y termino, no si nunca arranco
         if not self.mpv.is_running() and self.playing_ep and self.mpv.proc is not None:
             if self.playing_pod and self.playing_ep:
                 if self.playing_pod["uuid"] != "__files__":
@@ -658,7 +764,7 @@ class PocketTUI:
         self._draw_tabs(w)
         self._draw_separator(2, w)
 
-        player_h = 5 if (self.mpv.is_running() or self.playing_ep) else 0
+        player_h = 6 if (self.mpv.is_running() or self.playing_ep) else 0
         content_top = 3
         content_h   = h - content_top - player_h - 1
 
@@ -674,6 +780,9 @@ class PocketTUI:
 
         self._draw_footer(h - 1, w)
         self._draw_desc_overlay()
+        self._draw_search_overlay()
+        self._draw_keymap_overlay()
+        self._draw_theme_overlay()
         self.scr.refresh()
 
     def _now_playing_label(self):
@@ -766,20 +875,12 @@ class PocketTUI:
             return f"{fmt_dur(pos)}/{dur_str}  {date}"
         return f"{dur_str}  {date}"
 
-    def _draw_desc_overlay(self):
-        if not self.show_desc:
+    def _draw_search_overlay(self):
+        if not self.searching:
             return
-        ep = None
-        if self.view == self.VIEW_EPISODES and self.episodes:
-            ep = self.episodes[self.ep_cursor]
-        elif self.view == self.VIEW_QUEUE and self.queue_items:
-            ep = self.queue_items[self.q_cursor]
-        if not ep:
-            return
-
         h, w = self.scr.getmaxyx()
         ow = min(w - 4, 80)
-        oh = min(h - 4, 20)
+        oh = min(h - 4, 24)
         ox = (w - ow) // 2
         oy = (h - oh) // 2
 
@@ -792,41 +893,337 @@ class PocketTUI:
             except Exception:
                 pass
 
-        # Border
-        title = trunc(ep.get("title", ""), ow - 4)
+        # Search bar
+        is_ep  = self.view == self.VIEW_EPISODES
+        is_pod = self.view == self.VIEW_PODCASTS
+        label  = "Search episodes:" if is_ep else "Search podcasts:"
         self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
         try:
-            self.scr.addstr(oy, ox + 2, f" {title} ")
+            self.scr.addstr(oy, ox + 2, f" {label} ")
         except Exception:
             pass
         self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
-        # Description with word wrap
-        desc = ep.get("description", "No description available.")
-        words = desc.split()
-        lines = []
-        line  = ""
-        for word in words:
-            if len(line) + len(word) + 1 <= ow - 4:
-                line = f"{line} {word}".strip()
-            else:
-                if line:
-                    lines.append(line)
-                line = word
-        if line:
-            lines.append(line)
+        # Query input
+        query_display = self.search_query + "█"
+        self.scr.attron(curses.color_pair(2))
+        try:
+            self.scr.addstr(oy + 1, ox + 2, trunc(f"> {query_display}", ow - 4))
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(2))
 
-        max_lines = oh - 3
-        for i, l in enumerate(lines[:max_lines]):
+        # Separator
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(oy + 2, ox + 2, "─" * (ow - 4))
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
+        # Results
+        items   = self.search_results if is_ep else self.pod_search_results
+        cursor  = self.search_cursor  if is_ep else self.pod_search_cursor
+        offset  = self.search_offset  if is_ep else self.pod_search_offset
+        max_rows = oh - 5
+        visible = items[offset: offset + max_rows]
+
+        if not items and self.search_query:
+            self.scr.attron(curses.color_pair(3))
             try:
-                self.scr.addstr(oy + 1 + i, ox + 2, trunc(l, ow - 4))
+                self.scr.addstr(oy + 3, ox + 2, "No results." if len(self.search_query) > 1 else "Type to search...")
             except Exception:
                 pass
+            self.scr.attroff(curses.color_pair(3))
+        elif not self.search_query:
+            self.scr.attron(curses.color_pair(3))
+            try:
+                self.scr.addstr(oy + 3, ox + 2, "Type to search...")
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(3))
+
+        for i, item in enumerate(visible):
+            y   = oy + 3 + i
+            idx = offset + i
+            sel = idx == cursor
+            if is_ep:
+                left  = trunc(item.get("title", ""), ow - 16)
+                right = fmt_dur(item.get("duration", 0))
+            else:
+                left  = trunc(item.get("title", ""), ow - 20)
+                right = trunc(item.get("author", ""), 16)
+            line = f" {left:<{ow - len(right) - 5}} {right} "
+            try:
+                if sel:
+                    self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                    self.scr.addstr(y, ox, trunc(line, ow))
+                    self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                else:
+                    self.scr.addstr(y, ox, trunc(line, ow))
+            except Exception:
+                pass
+
+        # Hint
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(oy + oh - 1, ox + 2, "Enter=select  Esc=close")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
+    def _draw_theme_overlay(self):
+        if not self.show_themes:
+            return
+        h, w = self.scr.getmaxyx()
+        ow = min(w - 6, 40)
+        oh = len(self.THEMES) + 4
+        ox = (w - ow) // 2
+        oy = max(1, (h - oh) // 2)
+
+        for y in range(oh):
+            try:
+                if y == 0 or y == oh - 1:
+                    self.scr.attron(curses.color_pair(1))
+                    self.scr.addstr(oy + y, ox, "─" * ow)
+                    self.scr.attroff(curses.color_pair(1))
+                else:
+                    self.scr.addstr(oy + y, ox, "│" + " " * (ow - 2) + "│")
+            except Exception:
+                pass
+
+        self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
+        try:
+            self.scr.addstr(oy, ox + 2, "┤ Theme ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        for i, theme in enumerate(self.THEMES):
+            name = theme[0]
+            sel  = i == self.theme_cursor
+            active = i == self.current_theme
+            try:
+                if sel:
+                    self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                    self.scr.addstr(oy + 1 + i, ox + 2, f"  {'●' if active else '○'} {name:<24}")
+                    self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                else:
+                    col = curses.color_pair(2) if active else curses.color_pair(4)
+                    self.scr.attron(col)
+                    self.scr.addstr(oy + 1 + i, ox + 2, f"  {'●' if active else '○'} {name:<24}")
+                    self.scr.attroff(col)
+            except Exception:
+                pass
+
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(oy + oh - 1, ox + 2, "┤ Enter=apply  Esc=close ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
+    def _draw_keymap_overlay(self):
+        if not self.show_keys:
+            return
+        h, w = self.scr.getmaxyx()
+        ow = min(w - 6, 60)
+        oh = 28
+        ox = (w - ow) // 2
+        oy = max(1, (h - oh) // 2)
+
+        KEYS = [
+            ("Navigation", None),
+            ("1", "Podcasts"),
+            ("2", "In Progress"),
+            ("3", "New Episodes"),
+            ("4", "Starred"),
+            ("5", "Files / Audiobooks"),
+            ("↑↓ / j k", "Navigate list"),
+            ("PgUp PgDn", "Jump page"),
+            ("Enter", "Open / Play"),
+            ("Esc / Backspace", "Go back"),
+            ("/ ", "Search"),
+            ("d", "Episode description"),
+            ("", None),
+            ("Player", None),
+            ("Space / p", "Play / Pause"),
+            ("← →", "Seek ±30s"),
+            ("n / N", "Next / Prev chapter"),
+            ("] / [", "Speed up / down"),
+            ("S", "Cycle skip silence"),
+            ("", None),
+            ("Other", None),
+            ("t", "Theme selector"),
+            ("?", "This keymap"),
+            ("q", "Quit"),
+        ]
+
+        # Background box
+        for y in range(oh):
+            try:
+                if y == 0 or y == oh - 1:
+                    self.scr.attron(curses.color_pair(1))
+                    self.scr.addstr(oy + y, ox, "─" * ow)
+                    self.scr.attroff(curses.color_pair(1))
+                else:
+                    self.scr.addstr(oy + y, ox, "│" + " " * (ow - 2) + "│")
+            except Exception:
+                pass
+
+        # Title
+        self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
+        try:
+            self.scr.addstr(oy, ox + 2, "┤ Keymap ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # Keys
+        row = 1
+        for key, action in KEYS:
+            if row >= oh - 1:
+                break
+            try:
+                if action is None and key == "":
+                    row += 1
+                    continue
+                elif action is None:
+                    # Section header
+                    self.scr.attron(curses.color_pair(2) | curses.A_BOLD)
+                    self.scr.addstr(oy + row, ox + 2, key)
+                    self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+                else:
+                    self.scr.attron(curses.color_pair(3))
+                    self.scr.addstr(oy + row, ox + 4, f"{key:<16}")
+                    self.scr.attroff(curses.color_pair(3))
+                    self.scr.addstr(oy + row, ox + 21, action)
+            except Exception:
+                pass
+            row += 1
 
         # Close hint
         self.scr.attron(curses.color_pair(3))
         try:
-            self.scr.addstr(oy + oh - 1, ox + 2, "d / Esc = close")
+            self.scr.addstr(oy + oh - 1, ox + 2, "┤ ? / Esc = close ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
+    def _draw_desc_overlay(self):
+        if not self.show_desc:
+            return
+        ep = None
+        if self.view == self.VIEW_EPISODES and self.episodes:
+            ep = self.episodes[self.ep_cursor]
+        elif self.view == self.VIEW_QUEUE and self.queue_items:
+            ep = self.queue_items[self.q_cursor]
+        if not ep:
+            return
+
+        h, w = self.scr.getmaxyx()
+        ow = min(w - 6, 76)
+        oh = min(h - 6, 22)
+        ox = (w - ow) // 2
+        oy = (h - oh) // 2
+
+        # Solid background - draw border box
+        for y in range(oh):
+            try:
+                if y == 0 or y == oh - 1:
+                    self.scr.attron(curses.color_pair(1))
+                    self.scr.addstr(oy + y, ox, "─" * ow)
+                    self.scr.attroff(curses.color_pair(1))
+                else:
+                    self.scr.addstr(oy + y, ox, "│")
+                    self.scr.addstr(oy + y, ox + 1, " " * (ow - 2))
+                    self.scr.addstr(oy + y, ox + ow - 1, "│")
+            except Exception:
+                pass
+
+        # Title
+        title = trunc(ep.get("title", ""), ow - 6)
+        self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
+        try:
+            self.scr.addstr(oy, ox + 2, f"┤ {title} ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # Clean and format description with chapter breaks
+        import re
+        desc = ep.get("description", "No description available.")
+        desc = re.sub(r"<[^>]+>", "", desc)
+        desc = re.sub(r"https?://\S+", "", desc)
+        desc = re.sub(r"\s+", " ", desc).strip()
+
+        # Detect timestamp pattern and split into chapters
+        # Matches (00:00:00) or 00:00:00 at start of chapter
+        chunk_pattern = re.compile(r"\(?\d{1,2}:\d{2}(?::\d{2})?\)?")
+        parts = chunk_pattern.split(desc)
+        timestamps = chunk_pattern.findall(desc)
+
+        lines = []
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if not part:
+                continue
+            if i > 0 and i - 1 < len(timestamps):
+                # Add separator and timestamp header
+                lines.append("─" * (ow - 4))
+                ts = timestamps[i - 1].strip("()")
+                lines.append(f"▶ {ts}")
+            # Word wrap the chunk
+            words = part.split()
+            line  = ""
+            for word in words:
+                if len(line) + len(word) + 1 <= ow - 4:
+                    line = f"{line} {word}".strip()
+                else:
+                    if line:
+                        lines.append(line)
+                    line = word
+            if line:
+                lines.append(line)
+
+        if not lines:
+            lines = ["No description available."]
+
+        max_lines = oh - 3
+        # Simple scroll: use ep_cursor mod to track desc scroll (reuse search_offset as desc_offset)
+        desc_offset = getattr(self, "desc_offset", 0)
+        visible_lines = lines[desc_offset: desc_offset + max_lines]
+
+        for i, l in enumerate(visible_lines):
+            try:
+                if l.startswith("─"):
+                    self.scr.attron(curses.color_pair(3))
+                    self.scr.addstr(oy + 1 + i, ox + 2, trunc(l, ow - 4))
+                    self.scr.attroff(curses.color_pair(3))
+                elif l.startswith("▶"):
+                    self.scr.attron(curses.color_pair(2) | curses.A_BOLD)
+                    self.scr.addstr(oy + 1 + i, ox + 2, trunc(l, ow - 4))
+                    self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+                else:
+                    self.scr.addstr(oy + 1 + i, ox + 2, trunc(l, ow - 4))
+            except Exception:
+                pass
+
+        # Scroll hint if more content
+        if len(lines) > max_lines:
+            remaining = len(lines) - desc_offset - max_lines
+            scroll_hint = f"↓ {remaining} more lines" if remaining > 0 else "─ end ─"
+            self.scr.attron(curses.color_pair(3))
+            try:
+                self.scr.addstr(oy + oh - 1, ox + ow - len(scroll_hint) - 4, scroll_hint)
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(3))
+
+        # Close hint
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(oy + oh - 1, ox + 2, "┤ d / Esc = close ├")
         except Exception:
             pass
         self.scr.attroff(curses.color_pair(3))
@@ -892,7 +1289,9 @@ class PocketTUI:
     def _draw_list(self, top, height, w, items, cursor, offset, fmt):
         if not items:
             self.scr.attron(curses.color_pair(3))
-            self.scr.addstr(top + 1, 2, "No results.")
+            # Show loading if status says so, otherwise no results
+            msg = "Loading..." if "Loading" in self.status_msg else "No results."
+            self.scr.addstr(top + 1, 2, msg)
             self.scr.attroff(curses.color_pair(3))
             return
 
@@ -911,9 +1310,9 @@ class PocketTUI:
 
             try:
                 if sel:
-                    self.scr.attron(curses.color_pair(5) | curses.A_BOLD)
+                    self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
                     self.scr.addstr(y, 0, trunc(line, w))
-                    self.scr.attroff(curses.color_pair(5) | curses.A_BOLD)
+                    self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
                 else:
                     self.scr.addstr(y, 0, trunc(line, w))
                     # Colorear indicador al inicio del titulo
@@ -922,12 +1321,12 @@ class PocketTUI:
                         pos  = item.get("playedUpTo", 0) or 0
                         dur  = int(item.get("duration", 0) or 0)
                         if stat == 3 or (dur and int(pos) >= dur - 30):
-                            col = curses.color_pair(2)   # green
+                            col = curses.color_pair(2)   # verde
                         elif pos and int(pos) > 5:
-                            col = curses.color_pair(3)   # yellow
+                            col = curses.color_pair(3)   # amarillo
                         else:
                             col = curses.A_DIM
-                        self.scr.addstr(y, 1, left[0], col)  # position 1 = indicator
+                        self.scr.addstr(y, 1, left[0], col)  # posicion 1 = indicador
             except Exception:
                 pass
 
@@ -951,7 +1350,19 @@ class PocketTUI:
         ep_title  = self.playing_ep.get("title", "")  if self.playing_ep  else ""
         pod_title = self.playing_pod.get("title", "") if self.playing_pod else ""
 
-        # Line 1: podcast y episodio
+        # Chapter info - cache to avoid IPC call every frame
+        chapter_name = ""
+        if self.mpv.is_running():
+            ch_idx = self.mpv.get_chapter()
+            if not hasattr(self, "_ch_list_cache") or self._ch_list_tick % 10 == 0:
+                self._ch_list_cache = self.mpv.get_chapter_list()
+                self._ch_list_tick  = 0
+            self._ch_list_tick = getattr(self, "_ch_list_tick", 0) + 1
+            ch_list = self._ch_list_cache
+            if ch_list and ch_idx is not None and 0 <= ch_idx < len(ch_list):
+                chapter_name = ch_list[ch_idx].get("title", "")
+
+        # Line 1: podcast | episode
         self.scr.attron(curses.color_pair(1))
         self.scr.addstr(top, 1, trunc(f"♫  {pod_title}", w // 2))
         self.scr.attroff(curses.color_pair(1))
@@ -960,7 +1371,16 @@ class PocketTUI:
         self.scr.addstr(top, ep_x, trunc(ep_title, w - ep_x - 1))
         self.scr.attroff(curses.color_pair(4))
 
-        # Line 2: barra de progreso
+        # Line 1b: chapter name if available
+        if chapter_name:
+            self.scr.attron(curses.color_pair(8))
+            try:
+                self.scr.addstr(top, 1, trunc(f"  § {chapter_name}", w - 2))
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(8))
+
+        # Linea 2: barra de progreso
         if not self.mpv.is_running() and self.playing_ep:
             saved = int(self.playing_ep.get("playedUpTo", 0) or 0)
             state  = "▶"
@@ -1002,25 +1422,23 @@ class PocketTUI:
             pass
         self.scr.attroff(curses.color_pair(2))
 
-        # Line 3: pct completado
+        # Line 3: progress % + skip silence status
         pct = int(pos / dur * 100) if dur else 0
+        ss_labels = ["", "normal", "medium", "aggressive"]
+        ss_str = f"  skip:{ss_labels[self.skip_silence]}" if self.skip_silence else ""
         self.scr.attron(curses.color_pair(3))
         try:
-            self.scr.addstr(top + 2, 1, f"{pct}% completado")
+            self.scr.addstr(top + 2, 1, f"{pct}% completed{ss_str}")
         except Exception:
             pass
         self.scr.attroff(curses.color_pair(3))
 
-        # Line 4: controles
-        ss_labels = ["", "skip:normal", "skip:medium", "skip:aggressive"]
-        ss_str = f"  {ss_labels[self.skip_silence]}" if self.skip_silence else ""
-        ctrls = f"space/p=pause  ←/→=±30s  [=slower  ]=faster  S=skip silence{ss_str}  q=salir"
-        self.scr.attron(curses.color_pair(8))
-        try:
-            self.scr.addstr(top + 3, 1, trunc(ctrls, w - 2))
-        except Exception:
-            pass
-        self.scr.attroff(curses.color_pair(8))
+        # Line 4: key badges
+        self._draw_badges(top + 3, w, [
+            ("Spc", "pause"), ("←→", "±30s"), ("n/N", "chapter"),
+            ("]", "faster"), ("[", "slower"), ("S", "silence"),
+            ("t", "theme"), ("?", "keys"), ("q", "quit"),
+        ])
 
     def _draw_footer(self, y, w):
         msg   = self.status_msg
@@ -1029,22 +1447,149 @@ class PocketTUI:
             self.status_msg   = ""
             self.status_error = False
             msg = ""
-        if not msg and not (self.mpv.is_running() or self.playing_ep):
-            # Mostrar hint de navegacion cuando no hay player
-            hints = {
-                self.VIEW_PODCASTS:  "↑↓/jk=navigate  Enter=open  q=quit",
-                self.VIEW_EPISODES:  "↑↓/jk=navigate  Enter=play  Backspace=back  q=quit",
-                self.VIEW_QUEUE:     "↑↓/jk=navigate  Enter=play  q=quit",
-                self.VIEW_FILES:     "↑↓/jk=navigate  Enter=play  q=quit",
-            }
-            msg   = hints.get(self.view, "")
-            color = curses.color_pair(3)
+
+        if msg:
+            try:
+                self.scr.attron(color)
+                self.scr.addstr(y, 0, trunc(f" {msg}", w))
+                self.scr.attroff(color)
+            except Exception:
+                pass
+            return
+
+        # When player is active, footer is occupied by player controls - skip nav badges
+        if self.mpv.is_running() or self.playing_ep:
+            return
+
+        # Nav badges
+        nav_badges = {
+            self.VIEW_PODCASTS:  [("↑↓", "navigate"), ("Enter", "open"), ("/", "search"), ("t", "theme"), ("?", "keys"), ("q", "quit")],
+            self.VIEW_EPISODES:  [("↑↓", "navigate"), ("Enter", "play"), ("/", "search"), ("d", "desc"), ("Esc", "back"), ("?", "keys"), ("q", "quit")],
+            self.VIEW_QUEUE:     [("↑↓", "navigate"), ("Enter", "play"), ("d", "desc"), ("?", "keys"), ("q", "quit")],
+            self.VIEW_FILES:     [("↑↓", "navigate"), ("Enter", "play"), ("?", "keys"), ("q", "quit")],
+        }
+        badges = nav_badges.get(self.view, [])
+        self._draw_badges(y, w, badges)
+
+    def _draw_badges(self, y, w, badges):
+        """Draw key badges with consistent contrast regardless of theme"""
+        x = 1
+        for label, desc in badges:
+            if x >= w - 2:
+                break
+            try:
+                # Use reverse video for key label - always readable
+                self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                self.scr.addstr(y, x, f" {label} ")
+                self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                x += len(label) + 2
+                self.scr.attron(curses.color_pair(3))
+                self.scr.addstr(y, x, f"{desc} ")
+                self.scr.attroff(curses.color_pair(3))
+                x += len(desc) + 2
+            except Exception:
+                pass
+
+    def _handle_search_key(self, key):
+        is_ep  = self.view == self.VIEW_EPISODES
+        is_pod = self.view == self.VIEW_PODCASTS
+
+        if key in (curses.KEY_BACKSPACE, 127):
+            self.search_query = self.search_query[:-1]
+            self._update_search_results()
+            return True
+
+        if key in (curses.KEY_ENTER, 10, 13):
+            items  = self.search_results if is_ep else self.pod_search_results
+            cursor = self.search_cursor  if is_ep else self.pod_search_cursor
+            if not items:
+                return True
+            item = items[cursor]
+            self.searching    = False
+            self.search_query = ""
+            if is_ep:
+                # Play the episode
+                self.play(self.current_pod, item)
+            else:
+                # Open podcast from search result using its feed URL
+                pod = {
+                    "uuid": item.get("uuid", ""),
+                    "title": item.get("title", ""),
+                    "feedUrl": item.get("feedUrl", ""),
+                }
+                self._load_episodes_from_feed(pod)
+            return True
+
+        if key == curses.KEY_DOWN:
+            items = self.search_results if is_ep else self.pod_search_results
+            h, _  = self.scr.getmaxyx()
+            vis   = min(h - 10, 18)
+            if is_ep:
+                self.search_cursor, self.search_offset = self._scroll(
+                    self.search_cursor, self.search_offset, 1, len(items), vis)
+            else:
+                self.pod_search_cursor, self.pod_search_offset = self._scroll(
+                    self.pod_search_cursor, self.pod_search_offset, 1, len(items), vis)
+            return True
+
+        if key == curses.KEY_UP:
+            items = self.search_results if is_ep else self.pod_search_results
+            h, _  = self.scr.getmaxyx()
+            vis   = min(h - 10, 18)
+            if is_ep:
+                self.search_cursor, self.search_offset = self._scroll(
+                    self.search_cursor, self.search_offset, -1, len(items), vis)
+            else:
+                self.pod_search_cursor, self.pod_search_offset = self._scroll(
+                    self.pod_search_cursor, self.pod_search_offset, -1, len(items), vis)
+            return True
+
+        # Regular character input
+        if 32 <= key <= 126:
+            self.search_query += chr(key)
+            self._update_search_results()
+            return True
+
+        return True
+
+    def _update_search_results(self):
+        q = self.search_query.lower().strip()
+        if self.view == self.VIEW_EPISODES:
+            if not q:
+                self.search_results = []
+            else:
+                self.search_results = [
+                    ep for ep in self.episodes
+                    if q in ep.get("title", "").lower()
+                ]
+            self.search_cursor = 0
+            self.search_offset = 0
+        elif self.view == self.VIEW_PODCASTS:
+            if len(q) >= 2:
+                self.status("Searching...")
+                self.pod_search_results = self.api.search_podcasts(self.search_query)
+                self.status("")
+            else:
+                self.pod_search_results = []
+            self.pod_search_cursor = 0
+            self.pod_search_offset = 0
+
+    def _load_episodes_from_feed(self, pod):
+        """Load episodes for a podcast found via search (may not be subscribed)"""
+        self.current_pod = pod
+        self.status(f"Loading {pod.get('title', '')}...")
         try:
-            self.scr.attron(color)
-            self.scr.addstr(y, 0, trunc(f" {msg}", w))
-            self.scr.attroff(color)
-        except Exception:
-            pass
+            feed_url = pod.get("feedUrl") or self.api.podcast_feed_url(pod.get("title", ""))
+            if feed_url:
+                self.episodes = self.api.podcast_episodes_from_rss(feed_url)
+            else:
+                self.episodes = []
+            self.ep_cursor = 0
+            self.ep_offset = 0
+            self.view = self.VIEW_EPISODES
+            self.status(f"Loaded {len(self.episodes)} episodes")
+        except Exception as e:
+            self.status(f"Error: {e}", error=True)
 
     # ── Navigation helpers ────────────────────
 
@@ -1072,14 +1617,80 @@ class PocketTUI:
             if self.show_desc:
                 self.show_desc = False
                 return True
-            return False  # salir
+            if self.searching:
+                self.searching = False
+                self.search_query = ""
+                return True
+            return False  # quit
 
-        if key == 27 or (key == ord("d") and self.show_desc):  # Esc o d cierra overlay
+        if key == 27:  # Esc
+            if self.show_keys:
+                self.show_keys = False
+            elif self.show_desc:
+                self.show_desc = False
+            elif self.searching:
+                self.searching    = False
+                self.search_query = ""
+            elif self.view == self.VIEW_EPISODES:
+                self.view = self.VIEW_PODCASTS
+            return True
+
+        if key == ord("?") and not self.searching:
+            self.show_keys = not self.show_keys
+            return True
+
+        if key == ord("t") and not self.searching:
+            self.show_themes  = not self.show_themes
+            self.theme_cursor = self.current_theme
+            return True
+
+        # Theme overlay navigation
+        if self.show_themes:
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.theme_cursor = (self.theme_cursor + 1) % len(self.THEMES)
+            elif key in (curses.KEY_UP, ord("k")):
+                self.theme_cursor = (self.theme_cursor - 1) % len(self.THEMES)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                self.current_theme = self.theme_cursor
+                self._apply_theme(self.current_theme)
+                self.show_themes = False
+                self.status(f"Theme: {self.THEMES[self.current_theme][0]}")
+            elif key == 27:
+                self.show_themes = False
+            return True
+
+        if key == ord("d") and not self.searching and self.show_desc:
             self.show_desc = False
             return True
 
-        if key == ord("d") and self.view in (self.VIEW_EPISODES, self.VIEW_QUEUE):
-            self.show_desc = True
+        if key == ord("d") and not self.searching and self.view in (self.VIEW_EPISODES, self.VIEW_QUEUE):
+            self.show_desc   = True
+            self.desc_offset = 0
+            return True
+
+        # Scroll desc overlay with j/k or arrows when open
+        if self.show_desc and not self.searching:
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.desc_offset += 1
+                return True
+            if key in (curses.KEY_UP, ord("k")):
+                self.desc_offset = max(0, self.desc_offset - 1)
+                return True
+
+        # Search mode: capture ALL keystrokes - must come before view handlers
+        if self.searching:
+            return self._handle_search_key(key)
+
+        # Open search with /
+        if key == ord("/") and self.view in (self.VIEW_EPISODES, self.VIEW_PODCASTS):
+            self.searching      = True
+            self.search_query   = ""
+            self.search_results = []
+            self.pod_search_results = []
+            self.search_cursor  = 0
+            self.search_offset  = 0
+            self.pod_search_cursor = 0
+            self.pod_search_offset = 0
             return True
 
         if key == ord("1"):
@@ -1132,6 +1743,14 @@ class PocketTUI:
             self.mpv.seek(-30)
             return True
 
+        if key == ord("n") and self.mpv.is_running():
+            self.mpv.next_chapter()
+            return True
+
+        if key == ord("N") and self.mpv.is_running():
+            self.mpv.prev_chapter()
+            return True
+
         if key == ord("]") and self.mpv.is_running():
             self.speed_idx = min(len(self.SPEEDS) - 1, self.speed_idx + 1)
             self.mpv.set_speed(self.SPEEDS[self.speed_idx])
@@ -1150,7 +1769,7 @@ class PocketTUI:
             self.status(f"Skip silence: {labels[self.skip_silence]} (applies on next play)")
             return True
 
-        # Podcasts view
+        # Vista podcasts
         if self.view == self.VIEW_PODCASTS:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.pod_cursor, self.pod_offset = self._scroll(
@@ -1170,7 +1789,7 @@ class PocketTUI:
                     self.load_episodes(pod)
                     self.view = self.VIEW_EPISODES
 
-        # Episodes view
+        # Vista episodios
         elif self.view == self.VIEW_EPISODES:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.ep_cursor, self.ep_offset = self._scroll(
@@ -1191,7 +1810,7 @@ class PocketTUI:
             elif key in (curses.KEY_BACKSPACE, 127, ord("b")):
                 self.view = self.VIEW_PODCASTS
 
-        # Queue view (in_progress / new / starred)
+        # Vista queue (in_progress / new / starred)
         elif self.view == self.VIEW_QUEUE:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.q_cursor, self.q_offset = self._scroll(
@@ -1212,7 +1831,7 @@ class PocketTUI:
                     pod = {"uuid": pod_uuid, "title": ep.get("podcastTitle", "")}
                     self.play(pod, ep)
 
-        # Files view
+        # Vista files
         elif self.view == self.VIEW_FILES:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.f_cursor, self.f_offset = self._scroll(
@@ -1235,13 +1854,13 @@ class PocketTUI:
     # ── Main loop ─────────────────────────────
 
     def _load_last_played(self):
-        """Load last played episode/file on startup, shown as ready to play"""
+        """Carga el ultimo episodio/file reproducido al arrancar, pausado"""
         try:
-            # Latest in progress (podcasts) - usar playedUpToModified como timestamp
+            # Ultimos en progreso (podcasts) - usar playedUpToModified como timestamp
             in_prog = self.api.in_progress()
             last_ep = in_prog[0] if in_prog else None
 
-            # Latest files played
+            # Ultimos files tocados
             files = self.api.files()
             self.files_items = files
             with_progress = [f for f in files if (f.get("playedUpTo") or 0) > 5]
@@ -1274,7 +1893,7 @@ class PocketTUI:
             if not recent:
                 return
 
-            # Is it a file or episode?
+            # Es file o episodio?
             file_uuids = {f.get("uuid") for f in files}
             if recent.get("uuid") in file_uuids:
                 self.playing_pod = {"uuid": "__files__", "title": "Files"}
