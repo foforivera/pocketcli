@@ -4,7 +4,7 @@ pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 BUILD   = "2026-06-05"
 
 import os
@@ -1723,6 +1723,22 @@ class PocketTUI:
         if key in (ord("p"), ord(" ")):
             if self.mpv.is_running():
                 self.mpv.pause_toggle()
+                # Sync immediately on pause
+                if self.playing_pod and self.playing_ep:
+                    pos = self.mpv.get_position()
+                    pod, ep = self.playing_pod, self.playing_ep
+                    def _sync_pause():
+                        try:
+                            if pod["uuid"] == "__files__":
+                                self.api._post(f"/files/{ep['uuid']}", {
+                                    "playedUpTo": int(pos), "playingStatus": 2,
+                                })
+                            else:
+                                self.api.update_position(pod["uuid"], ep["uuid"], pos)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_sync_pause, daemon=True).start()
+                    self.last_sync = time.time()
             elif self.playing_ep:
                 # Start last loaded episode
                 if self.playing_pod and self.playing_pod.get("uuid") == "__files__":
