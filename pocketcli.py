@@ -4,7 +4,7 @@ pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 BUILD   = "2026-06-05"
 
 import os
@@ -1854,13 +1854,13 @@ class PocketTUI:
     # ── Main loop ─────────────────────────────
 
     def _load_last_played(self):
-        """Carga el ultimo episodio/file reproducido al arrancar, pausado"""
+        """Load last played episode/file on startup"""
         try:
-            # Ultimos en progreso (podcasts) - usar playedUpToModified como timestamp
+            # Latest in progress - Pocket Casts orders by most recently played
             in_prog = self.api.in_progress()
             last_ep = in_prog[0] if in_prog else None
 
-            # Ultimos files tocados
+            # Latest files with progress
             files = self.api.files()
             self.files_items = files
             with_progress = [f for f in files if (f.get("playedUpTo") or 0) > 5]
@@ -1871,29 +1871,39 @@ class PocketTUI:
             )
             last_file = last_file[0] if last_file else None
 
-            # Comparar por timestamp: episodios usan playedUpToModified (ms epoch string)
+            # Compare timestamps
+            # Episodes use playedUpToModified (ms epoch), files use modifiedAt (ISO)
+            # If episode has no timestamp, trust in_progress order (it's already sorted by recency)
             def ts(x):
                 if not x:
                     return 0
-                # files tienen ISO date, episodios tienen ms epoch
                 mod = x.get("modifiedAt") or x.get("playedUpToModified", "0")
                 try:
-                    if "T" in str(mod):  # ISO date de file
+                    if mod and "T" in str(mod):
                         from datetime import datetime
                         return datetime.fromisoformat(mod.replace("Z", "+00:00")).timestamp()
-                    return int(mod) / 1000  # ms epoch de episodio
+                    if mod and mod != "0":
+                        return int(mod) / 1000
                 except Exception:
-                    return 0
+                    pass
+                return 0
+
+            ep_ts   = ts(last_ep)
+            file_ts = ts(last_file)
 
             if last_ep and last_file:
-                recent = last_file if ts(last_file) > ts(last_ep) else last_ep
+                # If episode has no timestamp, trust in_progress order over file
+                if ep_ts == 0:
+                    recent = last_ep
+                else:
+                    recent = last_file if file_ts > ep_ts else last_ep
             else:
                 recent = last_ep or last_file
 
             if not recent:
                 return
 
-            # Es file o episodio?
+            # Is it a file or episode?
             file_uuids = {f.get("uuid") for f in files}
             if recent.get("uuid") in file_uuids:
                 self.playing_pod = {"uuid": "__files__", "title": "Files"}
