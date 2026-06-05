@@ -2,7 +2,15 @@
 
 A terminal UI client for [Pocket Casts](https://pocketcasts.com). Browse your podcasts, episodes, and uploaded files (audiobooks) from the command line, with bidirectional sync back to the app.
 
+> Because sometimes you just want to listen to podcasts without opening a browser, a PWA, an Electron app, and accidentally 47 Chrome tabs.
+
 Built with Python and `curses`. No Electron. No browser. Just a terminal.
+
+---
+
+## Inspired by CLIAMP
+
+[CLIAMP](https://github.com/brunosmmm/cliamp) is a terminal music player that proved you can have a great listening experience without sacrificing your RAM to the browser gods. Same philosophy here: less visual noise, more focus, and your computer actually stays cool.
 
 ---
 
@@ -103,7 +111,7 @@ You will be prompted for your Pocket Casts email and password. The auth token is
 | `N` | Previous chapter |
 | `]` | Speed up |
 | `[` | Speed down |
-| `S` | Cycle skip silence: off → normal → medium → aggressive |
+| `S` | Cycle skip silence: off -> normal -> medium -> aggressive |
 | `q` | Quit (saves position) |
 
 ---
