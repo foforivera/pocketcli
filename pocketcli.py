@@ -4,7 +4,7 @@ pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 BUILD   = "2026-06-05"
 
 import os
@@ -1892,11 +1892,13 @@ class PocketTUI:
             file_ts = ts(last_file)
 
             if last_ep and last_file:
-                # If episode has no timestamp, trust in_progress order over file
-                if ep_ts == 0:
-                    recent = last_ep
+                # If episode has no timestamp, file modifiedAt wins
+                if ep_ts == 0 and file_ts > 0:
+                    recent = last_file
+                elif file_ts > ep_ts:
+                    recent = last_file
                 else:
-                    recent = last_file if file_ts > ep_ts else last_ep
+                    recent = last_ep
             else:
                 recent = last_ep or last_file
 
