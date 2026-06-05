@@ -303,7 +303,7 @@ class MPV:
             cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        # conectar socket
+        # connect socket
         for _ in range(20):
             try:
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -431,7 +431,7 @@ def curses_login(stdscr):
     curses.noecho()
     password = stdscr.getstr(h // 2 + 1, (w - 30) // 2 + 10, 50).decode()
 
-    stdscr.addstr(h // 2 + 3, (w - 30) // 2, "Autenticando...")
+    stdscr.addstr(h // 2 + 3, (w - 30) // 2, "Authenticating...")
     stdscr.refresh()
 
     try:
@@ -444,7 +444,7 @@ def curses_login(stdscr):
         data = r.json()
         token = data.get("token")
         if not token:
-            return None, "Login fallido"
+            return None, "Login failed"
         save_config(email, token, data.get("uuid", ""))
         return token, None
     except Exception as e:
@@ -456,7 +456,7 @@ def curses_login(stdscr):
 # ─────────────────────────────────────────────
 
 class PocketTUI:
-    # Vistas
+    # Views
     VIEW_PODCASTS  = "podcasts"
     VIEW_EPISODES  = "episodes"
     VIEW_QUEUE     = "queue"     # in_progress / new / starred
@@ -470,7 +470,7 @@ class PocketTUI:
         self.api = api
         self.mpv = MPV()
 
-        # Estado navegacion
+        # Navigation state
         self.view          = self.VIEW_PODCASTS
         self.podcasts      = []
         self.episodes      = []
@@ -485,7 +485,7 @@ class PocketTUI:
         self.ep_offset     = 0
         self.q_offset      = 0
         self.f_offset      = 0
-        self.current_pod   = None  # dict podcast activo
+        self.current_pod   = None  # active podcast dict
 
         # Estado player
         self.playing_ep     = None  # dict episodio
@@ -645,7 +645,7 @@ class PocketTUI:
                 )
             self.mpv.quit()
 
-        # Wrap file como episodio con podcast_uuid especial
+        # Wrap file as episode with special podcast_uuid
         self.playing_pod = {"uuid": "__files__", "title": "Files"}
         self.playing_ep  = file_dict
         self.status("Fetching stream...")
@@ -668,10 +668,10 @@ class PocketTUI:
             return
 
         self.last_sync = time.time()
-        self.status(f"Reproduciendo: {file_dict.get('title', '')[:50]}")
+        self.status(f"Playing: {file_dict.get('title', '')[:50]}")
 
     def play(self, podcast_dict, episode_dict):
-        # Detener lo que haya
+        # Stop current playback
         if self.mpv.is_running():
             pos = self.mpv.get_position()
             if self.playing_pod and self.playing_ep:
@@ -687,7 +687,7 @@ class PocketTUI:
 
         url = self.api.episode_stream_url(podcast_dict["uuid"], episode_dict["uuid"])
         if not url:
-            # intentar campo directo
+            # try direct field
             url = episode_dict.get("url") or episode_dict.get("streamUrl")
         if not url:
             self.status("Could not get episode URL", error=True)
@@ -701,7 +701,7 @@ class PocketTUI:
             return
 
         self.last_sync = time.time()
-        self.status(f"Reproduciendo: {episode_dict.get('title', '')[:50]}")
+        self.status(f"Playing: {episode_dict.get('title', '')[:50]}")
 
     def sync_position(self):
         if not self.mpv.is_running():
@@ -729,7 +729,7 @@ class PocketTUI:
             threading.Thread(target=_sync, daemon=True).start()
 
     def check_finished(self):
-        # Solo limpiar si mpv estuvo corriendo y termino, no si nunca arranco
+        # Only clear if mpv was running and finished, not if it never started
         if not self.mpv.is_running() and self.playing_ep and self.mpv.proc is not None:
             if self.playing_pod and self.playing_ep:
                 if self.playing_pod["uuid"] != "__files__":
@@ -767,10 +767,6 @@ class PocketTUI:
         player_h = 6 if (self.mpv.is_running() or self.playing_ep) else 0
         content_top = 3
         content_h   = h - content_top - player_h - 1
-
-        import os
-        with open("/tmp/pocketcli_draw.txt", "w") as f:
-            f.write(f"h={h} w={w} player_h={player_h} playing_ep={bool(self.playing_ep)} mpv={self.mpv.is_running()}\n")
 
         self._draw_content(content_top, content_h, w)
 
@@ -1380,7 +1376,7 @@ class PocketTUI:
                 pass
             self.scr.attroff(curses.color_pair(8))
 
-        # Linea 2: barra de progreso
+        # Line 2: progress bar
         if not self.mpv.is_running() and self.playing_ep:
             saved = int(self.playing_ep.get("playedUpTo", 0) or 0)
             state  = "▶"
@@ -1723,12 +1719,12 @@ class PocketTUI:
                 self.load_files()
             return True
 
-        # Controles player (siempre disponibles)
+        # Player controls (always available)
         if key in (ord("p"), ord(" ")):
             if self.mpv.is_running():
                 self.mpv.pause_toggle()
             elif self.playing_ep:
-                # Arrancar el ultimo episodio cargado
+                # Start last loaded episode
                 if self.playing_pod and self.playing_pod.get("uuid") == "__files__":
                     self.play_file(self.playing_ep)
                 else:
@@ -1769,7 +1765,7 @@ class PocketTUI:
             self.status(f"Skip silence: {labels[self.skip_silence]} (applies on next play)")
             return True
 
-        # Vista podcasts
+        # Podcasts view
         if self.view == self.VIEW_PODCASTS:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.pod_cursor, self.pod_offset = self._scroll(
@@ -1789,7 +1785,7 @@ class PocketTUI:
                     self.load_episodes(pod)
                     self.view = self.VIEW_EPISODES
 
-        # Vista episodios
+        # Episodes view
         elif self.view == self.VIEW_EPISODES:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.ep_cursor, self.ep_offset = self._scroll(
@@ -1810,7 +1806,7 @@ class PocketTUI:
             elif key in (curses.KEY_BACKSPACE, 127, ord("b")):
                 self.view = self.VIEW_PODCASTS
 
-        # Vista queue (in_progress / new / starred)
+        # Queue view
         elif self.view == self.VIEW_QUEUE:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.q_cursor, self.q_offset = self._scroll(
@@ -1831,7 +1827,7 @@ class PocketTUI:
                     pod = {"uuid": pod_uuid, "title": ep.get("podcastTitle", "")}
                     self.play(pod, ep)
 
-        # Vista files
+        # Files view
         elif self.view == self.VIEW_FILES:
             if key == curses.KEY_DOWN or key == ord("j"):
                 self.f_cursor, self.f_offset = self._scroll(
@@ -1923,12 +1919,6 @@ class PocketTUI:
     def run(self):
         self.load_podcasts()
         self._load_last_played()
-
-        # Debug: log playing_ep state
-        import os
-        with open("/tmp/pocketcli_debug.txt", "w") as f:
-            f.write(f"playing_ep: {self.playing_ep}\n")
-            f.write(f"playing_pod: {self.playing_pod}\n")
 
         tick = 0
         while True:
