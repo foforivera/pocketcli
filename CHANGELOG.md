@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.7] - 2026-06-05
+### Fixed
+- File sync now uses correct endpoint (POST /files with array body)
+
+## [1.4.6] - 2026-06-05
+### Fixed
+- File playback position now syncs correctly to Pocket Casts
+
 ## [1.4.5] - 2026-06-05
 ### Fixed
 - Last played now correctly shows file when it was more recently played than a podcast episode

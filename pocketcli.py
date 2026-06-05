@@ -4,7 +4,7 @@ pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 BUILD   = "2026-06-05"
 
 import os
@@ -718,9 +718,12 @@ class PocketTUI:
             def _sync():
                 try:
                     if pod["uuid"] == "__files__":
-                        self.api._post(f"/files/{ep['uuid']}", {
-                            "playedUpTo": int(pos),
-                            "playingStatus": 2,
+                        self.api._post("/files", {
+                            "files": [{
+                                "uuid": ep["uuid"],
+                                "playedUpTo": int(pos),
+                                "playingStatus": 2,
+                            }]
                         })
                     else:
                         self.api.update_position(pod["uuid"], ep["uuid"], pos)
@@ -1730,8 +1733,12 @@ class PocketTUI:
                     def _sync_pause():
                         try:
                             if pod["uuid"] == "__files__":
-                                self.api._post(f"/files/{ep['uuid']}", {
-                                    "playedUpTo": int(pos), "playingStatus": 2,
+                                self.api._post("/files", {
+                                    "files": [{
+                                        "uuid": ep["uuid"],
+                                        "playedUpTo": int(pos),
+                                        "playingStatus": 2,
+                                    }]
                                 })
                             else:
                                 self.api.update_position(pod["uuid"], ep["uuid"], pos)
