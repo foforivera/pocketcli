@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.0] - 2026-06-05
+### Added
+- TOML-based theme system with 20 built-in themes (Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox, Rose Pine, and more)
+- Truecolor support: themes use exact hex colors on supported terminals, ANSI fallback on others
+- User themes: drop any `.toml` file in `~/.config/pocketcli/themes/` to add or override themes
+
 ## [1.4.7] - 2026-06-05
 ### Fixed
 - File sync now uses correct endpoint (POST /files with array body)

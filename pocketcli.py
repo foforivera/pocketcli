@@ -4,10 +4,11 @@ pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.4.7"
+VERSION = "1.5.0"
 BUILD   = "2026-06-05"
 
 import os
+import re
 import sys
 import json
 import time
@@ -26,6 +27,103 @@ import httpx
 
 CONFIG_DIR  = Path.home() / ".config" / "pocketcli"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
+THEMES_DIR  = CONFIG_DIR / "themes"
+
+# ── Theme helpers ──────────────────────────────────────────────────────────────
+
+def _parse_theme_toml(name, text):
+    """Parsea un TOML de tema minimalista, retorna dict con los campos."""
+    t = {"name": name, "accent": "", "bright_fg": "", "fg": "",
+         "green": "", "yellow": "", "red": ""}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip("\"'")
+        if key in t:
+            t[key] = val
+    return t
+
+def _hex_to_curses_color(hex_color, color_id):
+    """Registra un color truecolor en curses. Retorna True si funciono."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return False
+    try:
+        r = int(h[0:2], 16) * 1000 // 255
+        g = int(h[2:4], 16) * 1000 // 255
+        b = int(h[4:6], 16) * 1000 // 255
+        curses.init_color(color_id, r, g, b)
+        return True
+    except Exception:
+        return False
+
+def _hex_to_ansi(hex_color):
+    """Retorna el color ANSI de curses mas cercano al hex dado."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return curses.COLOR_WHITE
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    ansi = [
+        (curses.COLOR_BLACK,    0,   0,   0),
+        (curses.COLOR_RED,    170,   0,   0),
+        (curses.COLOR_GREEN,    0, 170,   0),
+        (curses.COLOR_YELLOW, 170, 170,   0),
+        (curses.COLOR_BLUE,     0,   0, 170),
+        (curses.COLOR_MAGENTA, 170,  0, 170),
+        (curses.COLOR_CYAN,     0, 170, 170),
+        (curses.COLOR_WHITE,  170, 170, 170),
+    ]
+    best, best_dist = curses.COLOR_WHITE, float("inf")
+    for color, cr, cg, cb in ansi:
+        dist = (r-cr)**2 + (g-cg)**2 + (b-cb)**2
+        if dist < best_dist:
+            best_dist, best = dist, color
+    return best
+
+def _load_themes():
+    """Carga temas builtin + temas de usuario en ~/.config/pocketcli/themes/.
+    Temas de usuario overridean builtins con el mismo nombre.
+    Retorna lista ordenada de dicts de tema."""
+    BUILTIN_THEMES = [
+        ("ayu-mirage-dark",  "accent=#73d0ff\nbright_fg=#f3f4f5\nfg=#cccac2\ngreen=#d5ff80\nyellow=#ffad66\nred=#f28779"),
+        ("catppuccin",       "accent=#89b4fa\nbright_fg=#cdd6f4\nfg=#9399b2\ngreen=#a6e3a1\nyellow=#f9e2af\nred=#f38ba8"),
+        ("catppuccin-latte", "accent=#1e66f5\nbright_fg=#4c4f69\nfg=#8c8fa1\ngreen=#40a02b\nyellow=#df8e1d\nred=#d20f39"),
+        ("dracula",          "accent=#bd93f9\nbright_fg=#f8f8f2\nfg=#6272a4\ngreen=#50fa7b\nyellow=#f1fa8c\nred=#ff5555"),
+        ("ember",            "accent=#e07040\nbright_fg=#e8d0b8\nfg=#907868\ngreen=#a08858\nyellow=#d8a050\nred=#c04848"),
+        ("ethereal",         "accent=#7d82d9\nbright_fg=#ffcead\nfg=#9a96a8\ngreen=#92a593\nyellow=#E9BB4F\nred=#ED5B5A"),
+        ("everforest",       "accent=#7fbbb3\nbright_fg=#d3c6aa\nfg=#7a8478\ngreen=#a7c080\nyellow=#dbbc7f\nred=#e67e80"),
+        ("flexoki-light",    "accent=#205EA6\nbright_fg=#100F0F\nfg=#6F6E69\ngreen=#879A39\nyellow=#D0A215\nred=#D14D41"),
+        ("gruvbox",          "accent=#7daea3\nbright_fg=#d4be98\nfg=#a89984\ngreen=#a9b665\nyellow=#d8a657\nred=#ea6962"),
+        ("hackerman",        "accent=#82FB9C\nbright_fg=#ddf7ff\nfg=#8e95b8\ngreen=#4fe88f\nyellow=#50f7d4\nred=#50f872"),
+        ("kanagawa",         "accent=#7e9cd8\nbright_fg=#dcd7ba\nfg=#938aa9\ngreen=#76946a\nyellow=#c0a36e\nred=#c34043"),
+        ("matte-black",      "accent=#e68e0d\nbright_fg=#bebebe\nfg=#777777\ngreen=#FFC107\nyellow=#b91c1c\nred=#D35F5F"),
+        ("miasma",           "accent=#78824b\nbright_fg=#c2c2b0\nfg=#666666\ngreen=#5f875f\nyellow=#b36d43\nred=#685742"),
+        ("neon-blade-runner","accent=#e8609a\nbright_fg=#b8c4d0\nfg=#758494\ngreen=#4eb8a8\nyellow=#d4a040\nred=#c85070"),
+        ("nord",             "accent=#81a1c1\nbright_fg=#d8dee9\nfg=#8690a0\ngreen=#a3be8c\nyellow=#ebcb8b\nred=#bf616a"),
+        ("osaka-jade",       "accent=#509475\nbright_fg=#F7E8B2\nfg=#C1C497\ngreen=#549e6a\nyellow=#459451\nred=#FF5345"),
+        ("ristretto",        "accent=#f38d70\nbright_fg=#e6d9db\nfg=#948a8b\ngreen=#adda78\nyellow=#f9cc6c\nred=#fd6883"),
+        ("rose-pine",        "accent=#56949f\nbright_fg=#575279\nfg=#908caa\ngreen=#286983\nyellow=#ea9d34\nred=#b4637a"),
+        ("tokyo-night",      "accent=#7aa2f7\nbright_fg=#cfc9c2\nfg=#737aa2\ngreen=#9ece6a\nyellow=#e0af68\nred=#f7768e"),
+        ("vantablack",       "accent=#8d8d8d\nbright_fg=#ffffff\nfg=#8d8d8d\ngreen=#b6b6b6\nyellow=#cecece\nred=#a4a4a4"),
+    ]
+    themes = {}
+    # Builtin primero (menor prioridad)
+    for name, text in BUILTIN_THEMES:
+        themes[name] = _parse_theme_toml(name, text)
+    # Temas de usuario overridean builtins
+    if THEMES_DIR.exists():
+        for f in sorted(THEMES_DIR.glob("*.toml")):
+            name = f.stem
+            try:
+                themes[name] = _parse_theme_toml(name, f.read_text())
+            except Exception:
+                pass
+    return sorted(themes.values(), key=lambda t: t["name"].lower())
 SOCKET_PATH = "/tmp/pocketcli-mpv.sock"
 BASE_URL    = "https://api.pocketcasts.com"
 
@@ -511,24 +609,17 @@ class PocketTUI:
         self.show_themes        = False
         self.theme_cursor       = 0
 
-        # Theme definitions: (accent, active, info, selection_fg, selection_bg, header_fg, header_bg, error, sub)
-        self.THEMES = [
-            ("Default",        curses.COLOR_CYAN,    curses.COLOR_GREEN,   curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_CYAN,    curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_MAGENTA),
-            ("Dracula",        curses.COLOR_MAGENTA, curses.COLOR_GREEN,   curses.COLOR_CYAN,   curses.COLOR_BLACK, curses.COLOR_MAGENTA, curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_CYAN),
-            ("Nord",           curses.COLOR_CYAN,    curses.COLOR_BLUE,    curses.COLOR_WHITE,  curses.COLOR_BLACK, curses.COLOR_CYAN,    curses.COLOR_BLUE,  curses.COLOR_BLUE,   curses.COLOR_RED,    curses.COLOR_WHITE),
-            ("Gruvbox",        curses.COLOR_YELLOW,  curses.COLOR_GREEN,   curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_YELLOW,  curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_MAGENTA),
-            ("Solarized Dark", curses.COLOR_CYAN,    curses.COLOR_GREEN,   curses.COLOR_BLUE,   curses.COLOR_BLACK, curses.COLOR_CYAN,    curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_YELLOW),
-            ("Monokai",        curses.COLOR_GREEN,   curses.COLOR_MAGENTA, curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_GREEN,   curses.COLOR_BLACK, curses.COLOR_MAGENTA,curses.COLOR_RED,    curses.COLOR_CYAN),
-            ("Catppuccin",     curses.COLOR_MAGENTA, curses.COLOR_CYAN,    curses.COLOR_BLUE,   curses.COLOR_BLACK, curses.COLOR_MAGENTA, curses.COLOR_BLACK, curses.COLOR_CYAN,   curses.COLOR_RED,    curses.COLOR_WHITE),
-            ("Tokyo Night",    curses.COLOR_BLUE,    curses.COLOR_MAGENTA, curses.COLOR_CYAN,   curses.COLOR_BLACK, curses.COLOR_BLUE,    curses.COLOR_BLACK, curses.COLOR_MAGENTA,curses.COLOR_RED,    curses.COLOR_CYAN),
-            ("Everforest",     curses.COLOR_GREEN,   curses.COLOR_GREEN,   curses.COLOR_YELLOW, curses.COLOR_BLACK, curses.COLOR_GREEN,   curses.COLOR_BLACK, curses.COLOR_GREEN,  curses.COLOR_RED,    curses.COLOR_YELLOW),
-            ("Rosé Pine",      curses.COLOR_MAGENTA, curses.COLOR_CYAN,    curses.COLOR_WHITE,  curses.COLOR_BLACK, curses.COLOR_MAGENTA, curses.COLOR_BLACK, curses.COLOR_CYAN,   curses.COLOR_RED,    curses.COLOR_WHITE),
-        ]
+        # Cargar temas desde TOML (builtin + usuario)
+        self.THEMES = _load_themes()
         self.current_theme = 0
 
         # Colors
         curses.start_color()
         curses.use_default_colors()
+        self._truecolor = curses.can_change_color() and curses.COLORS >= 256
+        # IDs de color custom (16-24) para truecolor
+        self._tc_ids = list(range(16, 25))
+        self._apply_theme(0)
         self._apply_theme(0)
 
         curses.curs_set(0)
@@ -536,16 +627,34 @@ class PocketTUI:
         self.scr.keypad(True)
 
     def _apply_theme(self, idx):
-        t    = self.THEMES[idx]
-        name, accent, active, info, sel_fg, sel_bg, hdr_fg, hdr_bg, error, sub = t
-        curses.init_pair(1, accent,              -1)       # title / accent
-        curses.init_pair(2, active,              -1)       # active / play
-        curses.init_pair(3, info,                -1)       # info / secondary
-        curses.init_pair(4, curses.COLOR_WHITE,  -1)       # normal text
-        curses.init_pair(5, sel_fg,              sel_bg)   # selection
-        curses.init_pair(6, hdr_fg,              hdr_bg)   # header bar
-        curses.init_pair(7, error,               -1)       # error
-        curses.init_pair(8, sub,                 -1)       # subtitle / chapter
+        t = self.THEMES[idx]
+        tc = self._truecolor
+
+        def color(hex_val, slot):
+            """Retorna un color curses: truecolor si es posible, ANSI si no."""
+            if tc and hex_val:
+                cid = self._tc_ids[slot]
+                if _hex_to_curses_color(hex_val, cid):
+                    return cid
+            return _hex_to_ansi(hex_val) if hex_val else curses.COLOR_WHITE
+
+        accent   = color(t["accent"],    0)
+        active   = color(t["green"],     1)
+        info     = color(t["yellow"],    2)
+        sel_fg   = color(t["bright_fg"], 3)
+        hdr_fg   = color(t["accent"],    4)
+        error    = color(t["red"],       5)
+        sub      = color(t["fg"],        6)
+        sel_bg   = color(t["fg"],        7)
+
+        curses.init_pair(1, accent,             -1)   # title / accent
+        curses.init_pair(2, active,             -1)   # active / play
+        curses.init_pair(3, info,               -1)   # info / secondary
+        curses.init_pair(4, curses.COLOR_WHITE, -1)   # normal text
+        curses.init_pair(5, sel_fg,             sel_bg) # selection
+        curses.init_pair(6, hdr_fg,             -1)   # header bar
+        curses.init_pair(7, error,              -1)   # error
+        curses.init_pair(8, sub,                -1)   # subtitle / chapter
 
     # ── Data loading ──────────────────────────
 
@@ -999,7 +1108,7 @@ class PocketTUI:
         self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
         for i, theme in enumerate(self.THEMES):
-            name = theme[0]
+            name = theme["name"]
             sel  = i == self.theme_cursor
             active = i == self.current_theme
             try:
@@ -1653,7 +1762,7 @@ class PocketTUI:
                 self.current_theme = self.theme_cursor
                 self._apply_theme(self.current_theme)
                 self.show_themes = False
-                self.status(f"Theme: {self.THEMES[self.current_theme][0]}")
+                self.status(f"Theme: {self.THEMES[self.current_theme]['name']}")
             elif key == 27:
                 self.show_themes = False
             return True
