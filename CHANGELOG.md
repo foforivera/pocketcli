@@ -1,32 +1,38 @@
 # Changelog
 
+## [1.6.1] - 2026-06-06
+
+### Fixed
+- Subscribe now resolves the real Pocket Casts UUID from the feed URL before calling the API (fixes 400 Bad Request)
+- Unsubscribe confirm overlay now uses key badges matching the rest of the UI
+- Removed redundant `n` cancel key from unsubscribe confirm — only `y` to confirm, `Esc` to cancel
+
 ## [1.6.0] - 2026-06-06
 
 ### Added
 - **Discover tab** (`6`) — search and subscribe to any podcast via iTunes directly from the TUI
 - **Subscribe from Discover** — press `Enter` on a search result to subscribe; `✓` indicator shows already-subscribed podcasts
-- **Unsubscribe with confirmation** — press `u` on any podcast in the Podcasts tab; confirm with `y` or cancel with `n` / `Esc`
+- **Unsubscribe with confirmation** — press `u` on any podcast in the Podcasts tab; confirm with `y` or cancel with `Esc`
 - Podcast list reloads automatically after subscribing or unsubscribing
 
 ### Changed
 - All data loading (queue, files) now runs in background threads — UI stays responsive
 - `sync_episode` and `sync_file` are now separate API methods with cleaner names
-- `_push_sync` helper in TUI eliminates duplicated sync logic across pause, periodic sync, and exit
+- `_push_sync` helper eliminates duplicated sync logic across pause, periodic sync, and exit
 - `SILENCE_FILTERS` moved to a top-level dict constant — cleaner MPV launch code
 - All imports moved to top level (no more imports inside methods)
-- `_itunes_search` extracted as shared API helper used by search and episode fetching
-- Separate `httpx.Client` instance for external API calls (no auth header conflicts)
-- `_overlay_box` helper shared across all overlays (theme, keymap, desc, unsub confirm)
+- `_itunes_search` extracted as shared API helper
+- Separate `httpx.Client` for external API calls (no auth header conflicts)
+- `_overlay_box` helper shared across all overlays
 - `_draw_tabs` rewritten with a declarative list of tuples
 - `load_queue` and `load_files` moved to background threads
-- Tab 1 now correctly stays active when in episode view
-- `_scroll` now handles `total == 0` without errors
 - 271 fewer lines overall with no functionality removed
 
 ### Fixed
-- `q` key now correctly closes discover input mode and unsub confirm before quitting
-- `discover_searching` input now captured before global keys (`t`, `?`, `p`, `S`, etc.) — no interference
+- `q` key now correctly closes discover input and unsub confirm before quitting
+- `discover_searching` captured before global keys — no interference with `t`, `?`, `p`, `S`, etc.
 - `_apply_theme` was called twice on init — now called once
+- `_scroll` now handles `total == 0` without errors
 
 ## [1.5.0] - 2026-06-05
 

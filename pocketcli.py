@@ -4,7 +4,7 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 BUILD   = "2026-06-06"
 
 import os
@@ -220,6 +220,21 @@ class API:
 
     def subscribed_podcasts(self):
         return self._post("/user/podcast/list", {"v": 1}).get("podcasts", [])
+
+    def resolve_podcast_uuid(self, feed_url):
+        """Resolve a Pocket Casts UUID from a feed URL."""
+        try:
+            r = self.client.post(
+                f"{BASE_URL}/discover/search",
+                json={"term": feed_url},
+            )
+            if r.status_code == 200:
+                podcasts = r.json().get("podcasts", [])
+                if podcasts:
+                    return podcasts[0].get("uuid")
+        except Exception:
+            pass
+        return None
 
     def subscribe_podcast(self, podcast_uuid):
         return self._post("/user/podcast/subscribe", {"uuid": podcast_uuid})
@@ -881,24 +896,42 @@ class PocketTUI:
     # ─────────────────────────────────────────
 
     def _do_subscribe(self, pod):
-        uuid = pod.get("uuid", "")
-        if not uuid:
-            self.status("Cannot subscribe: no UUID.", error=True)
+        title    = pod.get("title", "")
+        feed_url = pod.get("feedUrl", "")
+        itunes_id = pod.get("uuid", "")  # this is actually iTunes collectionId
+
+        # Check if already subscribed by iTunes ID (pre-resolution)
+        if itunes_id in self.subscribed_uuids:
+            self.status(f"Already subscribed to {title}")
             return
-        if uuid in self.subscribed_uuids:
-            self.status(f"Already subscribed to {pod.get('title', '')}")
-            return
-        self.status(f"Subscribing to {pod.get('title', '')}...")
+
+        self.status(f"Subscribing to {title}...")
+
         def _sub():
             try:
-                self.api.subscribe_podcast(uuid)
-                self.subscribed_uuids.add(uuid)
+                # Resolve the real Pocket Casts UUID from the feed URL
+                pc_uuid = None
+                if feed_url:
+                    pc_uuid = self.api.resolve_podcast_uuid(feed_url)
+
+                if not pc_uuid:
+                    self.status(f"Could not resolve podcast UUID for {title}", error=True)
+                    return
+
+                # Check again with the real PC UUID
+                if pc_uuid in self.subscribed_uuids:
+                    self.status(f"Already subscribed to {title}")
+                    return
+
+                self.api.subscribe_podcast(pc_uuid)
+                self.subscribed_uuids.add(pc_uuid)
                 pods = self.api.subscribed_podcasts()
                 pods.sort(key=lambda p: p.get("title", "").lower())
                 self.podcasts = pods
-                self.status(f"Subscribed to {pod.get('title', '')}!")
+                self.status(f"Subscribed to {title}!")
             except Exception as e:
                 self.status(f"Subscribe error: {e}", error=True)
+
         threading.Thread(target=_sub, daemon=True).start()
 
     def _do_unsubscribe(self):
@@ -1681,7 +1714,7 @@ class PocketTUI:
         h, w  = self.scr.getmaxyx()
         title = self.unsub_target.get("title", "this podcast")
         msg   = f"Unsubscribe from: {trunc(title, 40)}?"
-        ow    = max(len(msg) + 8, 50)
+        ow    = max(len(msg) + 8, 52)
         oh    = 5
         ox    = (w - ow) // 2
         oy    = (h - oh) // 2
@@ -1691,12 +1724,20 @@ class PocketTUI:
             self.scr.addstr(oy + 1, ox + 2, trunc(msg, ow - 4))
         except Exception:
             pass
-        self.scr.attron(curses.color_pair(3))
-        try:
-            self.scr.addstr(oy + 3, ox + 2, "┤ y = confirm   n / Esc = cancel ├")
-        except Exception:
-            pass
-        self.scr.attroff(curses.color_pair(3))
+        # Key badges inline, starting at ox + 2
+        bx = ox + 2
+        for label, desc in [("y", "confirm"), ("Esc", "cancel")]:
+            try:
+                self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                self.scr.addstr(oy + 3, bx, f" {label} ")
+                self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                bx += len(label) + 2
+                self.scr.attron(curses.color_pair(3))
+                self.scr.addstr(oy + 3, bx, f"{desc} ")
+                self.scr.attroff(curses.color_pair(3))
+                bx += len(desc) + 2
+            except Exception:
+                pass
 
     # ─────────────────────────────────────────
     # Input handling
