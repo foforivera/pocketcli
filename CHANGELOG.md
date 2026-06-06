@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.7.0] - 2026-06-06
+
+### Added
+- **Tab navigation** — `Tab` cycles focus between content, tab bar, and sub-menu (Discover); `Shift+Tab` goes backwards
+- **Visual tab focus** — focused tab shows as reverse highlight, active tab stays green; clear distinction between "where you are" and "where the cursor is"
+- **Discover sub-menu navigation** — when focus is on the Discover sub-menu, `←` `→` move between Trending / Popular / Featured; `Enter` loads the selected list
+- **Curated lists in Discover** — Trending, Popular, and Featured load automatically from `lists.pocketcasts.com` when entering the Discover tab; no search needed to browse
+- **Delete file from cloud** — press `x` on any file in the Files tab to delete it from Pocket Casts cloud storage
+- **Smart delete confirmation** — played files (●) get a single confirm; unplayed or in-progress files (○ ◐) get a two-step confirm with progress shown
+
+### Changed
+- `TABS` and `DISCOVER_MODES` extracted as top-level constants — single source of truth for tab definitions
+- `_activate_tab()` centralizes all tab-switching logic including data loading
+- `_current_tab_idx()` derives the active tab index from app state instead of a separate variable
+- `_close_discover_search()` eliminates duplicated close logic across `q`, `Esc`, and the key handler
+- `from datetime import datetime` moved to top-level imports — no lazy imports inside methods
+- Discover list visible rows calculated via `_visible_rows() - 2` instead of a hardcoded offset
+- `f`, `p`, `e` keybinds removed from Discover — Tab navigation replaces them cleanly
+- `_draw_badges_at(y, x, badges)` helper added for overlay badge rows at arbitrary positions
+
+### Fixed
+- Cursor scroll bug: `_visible_rows()` used `player_h=4` but `draw()` reserved `player_h=6`; cursor went invisible 2 rows before scroll triggered
+- Discover key handler used hardcoded `h - 8` for visible rows; now uses `_visible_rows()` consistently
+
 ## [1.6.1] - 2026-06-06
 
 ### Fixed
