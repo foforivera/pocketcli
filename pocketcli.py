@@ -4,7 +4,7 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 BUILD   = "2026-06-06"
 
 import os
@@ -19,6 +19,7 @@ import configparser
 import threading
 import urllib.parse
 import urllib.request
+from datetime import datetime
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -35,6 +36,24 @@ THEMES_DIR  = CONFIG_DIR / "themes"
 SOCKET_PATH = "/tmp/pocketcli-mpv.sock"
 BASE_URL    = "https://api.pocketcasts.com"
 ITUNES_URL  = "https://itunes.apple.com/search"
+LISTS_URL   = "https://lists.pocketcasts.com"
+
+# Tab definitions: (key, label, view, queue_mode)
+TABS = [
+    ("1", "Podcasts",    "podcasts",  None),
+    ("2", "In Progress", "queue",     "in_progress"),
+    ("3", "New",         "queue",     "new"),
+    ("4", "Starred",     "queue",     "starred"),
+    ("5", "Files",       "files",     None),
+    ("6", "Discover",    "discover",  None),
+]
+
+# Discover sub-modes
+DISCOVER_MODES = [
+    ("trending", "Trending"),
+    ("popular",  "Popular"),
+    ("featured", "Featured"),
+]
 
 SPEEDS      = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
 
@@ -357,6 +376,13 @@ class API:
     def starred(self):
         return self._post("/user/starred").get("episodes", [])
 
+    # ── Curated lists ──
+
+    def curated_list(self, mode):
+        r = self._ext.get(f"{LISTS_URL}/{mode}.json")
+        r.raise_for_status()
+        return r.json().get("podcasts", [])
+
     # ── Search ──
 
     def search_podcasts(self, query):
@@ -431,6 +457,11 @@ class API:
             }]})
         except Exception:
             pass
+
+    def delete_file(self, file_uuid):
+        """Delete a file from Pocket Casts cloud storage."""
+        r = self.client.delete(f"{BASE_URL}/files/{file_uuid}")
+        r.raise_for_status()
 
     def mark_played(self, podcast_uuid, episode_uuid):
         try:
@@ -607,6 +638,11 @@ class PocketTUI:
     VIEW_FILES    = "files"
     VIEW_DISCOVER = "discover"
 
+    # Focus levels
+    FOCUS_CONTENT = 0   # list navigation (default)
+    FOCUS_TABBAR  = 1   # top tab bar
+    FOCUS_SUBMENU = 2   # discover mode bar
+
     # Color pair semantics (applied by _apply_theme)
     # 1=accent  2=active/green  3=info/yellow  4=normal
     # 5=selection  6=header  7=error  8=subtitle/dim
@@ -631,6 +667,11 @@ class PocketTUI:
         self.q_cursor   = self.q_offset   = 0
         self.f_cursor   = self.f_offset   = 0
 
+        # ── Focus / Tab navigation ──
+        self.focus_level          = self.FOCUS_CONTENT
+        self.tab_cursor           = 0
+        self.discover_mode_cursor = 0
+
         # ── Player state ──
         self.playing_pod  = None
         self.playing_ep   = None
@@ -654,15 +695,23 @@ class PocketTUI:
         self.pod_search_cursor  = self.pod_search_offset = 0
 
         # ── Discover / subscribe ──
-        self.discover_query    = ""
-        self.discover_results  = []
-        self.discover_cursor   = self.discover_offset = 0
+        self.discover_query     = ""
+        self.discover_results   = []
+        self.discover_cursor    = self.discover_offset = 0
         self.discover_searching = False
-        self.subscribed_uuids  = set()
+        self.subscribed_uuids   = set()
+        # Curated lists: "trending" | "popular" | "featured"
+        self.discover_list_mode = "trending"
+        self.discover_lists     = {}   # cache: mode -> list of podcasts
 
         # ── Unsubscribe confirm ──
         self.unsub_confirm = False
         self.unsub_target  = None
+
+        # ── Delete file confirm ──
+        # step: 0=inactive, 1=first confirm, 2=second confirm (unplayed/in-progress)
+        self.del_file_step   = 0
+        self.del_file_target = None
 
         # ── Status bar ──
         self.status_msg   = ""
@@ -797,6 +846,29 @@ class PocketTUI:
                 self.status(f"Error: {e}", error=True)
         threading.Thread(target=_load, daemon=True).start()
 
+    def load_discover_list(self, mode=None):
+        if mode:
+            self.discover_list_mode = mode
+        m = self.discover_list_mode
+        # Use cache if available and not searching
+        if m in self.discover_lists and not self.discover_query:
+            self.discover_results  = self.discover_lists[m]
+            self.discover_cursor   = self.discover_offset = 0
+            return
+        self.status(f"Loading {m}...")
+        def _load():
+            try:
+                pods = self.api.curated_list(m)
+                self.discover_lists[m] = pods
+                # Only apply if still in same mode and not searching
+                if self.discover_list_mode == m and not self.discover_query:
+                    self.discover_results = pods
+                    self.discover_cursor  = self.discover_offset = 0
+                self.status("")
+            except Exception as e:
+                self.status(f"Error loading {m}: {e}", error=True)
+        threading.Thread(target=_load, daemon=True).start()
+
     # ─────────────────────────────────────────
     # Player
     # ─────────────────────────────────────────
@@ -898,10 +970,14 @@ class PocketTUI:
     def _do_subscribe(self, pod):
         title    = pod.get("title", "")
         feed_url = pod.get("feedUrl", "")
-        itunes_id = pod.get("uuid", "")  # this is actually iTunes collectionId
+        raw_uuid = pod.get("uuid", "")
 
-        # Check if already subscribed by iTunes ID (pre-resolution)
-        if itunes_id in self.subscribed_uuids:
+        # Determine if uuid is already a real PC uuid (has dashes, not purely numeric)
+        # PC uuids look like: 395bad80-26fe-0139-32ce-0acc26574db2
+        # iTunes collectionIds are purely numeric: 1234567890
+        is_pc_uuid = "-" in raw_uuid and not raw_uuid.isdigit()
+
+        if raw_uuid in self.subscribed_uuids:
             self.status(f"Already subscribed to {title}")
             return
 
@@ -909,16 +985,16 @@ class PocketTUI:
 
         def _sub():
             try:
-                # Resolve the real Pocket Casts UUID from the feed URL
-                pc_uuid = None
-                if feed_url:
-                    pc_uuid = self.api.resolve_podcast_uuid(feed_url)
+                if is_pc_uuid:
+                    # From curated list: UUID is already the real PC uuid
+                    pc_uuid = raw_uuid
+                else:
+                    # From iTunes search: resolve via feed URL
+                    pc_uuid = self.api.resolve_podcast_uuid(feed_url) if feed_url else None
+                    if not pc_uuid:
+                        self.status(f"Could not resolve UUID for {title}", error=True)
+                        return
 
-                if not pc_uuid:
-                    self.status(f"Could not resolve podcast UUID for {title}", error=True)
-                    return
-
-                # Check again with the real PC UUID
                 if pc_uuid in self.subscribed_uuids:
                     self.status(f"Already subscribed to {title}")
                     return
@@ -1046,6 +1122,7 @@ class PocketTUI:
         self._draw_theme_overlay()
         self._draw_keymap_overlay()
         self._draw_unsub_confirm_overlay()
+        self._draw_delete_file_overlay()
 
         self.scr.refresh()
 
@@ -1070,27 +1147,141 @@ class PocketTUI:
                 pass
             self.scr.attroff(curses.color_pair(6))
 
+    def _current_tab_idx(self):
+        """Return index in TABS matching current view/queue_mode."""
+        for i, (_, _, view, qmode) in enumerate(TABS):
+            if view == "queue":
+                if self.view == self.VIEW_QUEUE and self.queue_mode == qmode:
+                    return i
+            elif view == "podcasts":
+                if self.view in (self.VIEW_PODCASTS, self.VIEW_EPISODES):
+                    return i
+            elif view == self.view:
+                return i
+        return 0
+
+    def _activate_tab(self, idx):
+        """Switch to the tab at index idx."""
+        _, _, view, qmode    = TABS[idx]
+        self.tab_cursor      = idx
+        self.focus_level     = self.FOCUS_CONTENT
+
+        if view == "podcasts":
+            self.view = self.VIEW_PODCASTS
+            if not self.podcasts:
+                self.load_podcasts()
+        elif view == "queue":
+            self.view       = self.VIEW_QUEUE
+            self.queue_mode = qmode
+            self.load_queue()
+        elif view == "files":
+            self.view = self.VIEW_FILES
+            if not self.files_items:
+                self.load_files()
+        elif view == "discover":
+            self.view             = self.VIEW_DISCOVER
+            self.subscribed_uuids = {p.get("uuid", "") for p in self.podcasts}
+            if not self.discover_query and not self.discover_results:
+                self.load_discover_list()
+
     def _draw_tabs(self, w):
-        TAB_DEFS = [
-            ("1", "Podcasts",    lambda: self.view in (self.VIEW_PODCASTS, self.VIEW_EPISODES)),
-            ("2", "In Progress", lambda: self.view == self.VIEW_QUEUE and self.queue_mode == "in_progress"),
-            ("3", "New",         lambda: self.view == self.VIEW_QUEUE and self.queue_mode == "new"),
-            ("4", "Starred",     lambda: self.view == self.VIEW_QUEUE and self.queue_mode == "starred"),
-            ("5", "Files",       lambda: self.view == self.VIEW_FILES),
-            ("6", "Discover",    lambda: self.view == self.VIEW_DISCOVER),
-        ]
+        """Tab bar: active=green, focused(FOCUS_TABBAR)=reverse, others=dim."""
+        active_idx = self._current_tab_idx()
         x = 1
-        for key, label, is_active in TAB_DEFS:
-            active = is_active()
-            tag    = f"[{key}] {label}"
-            pair   = curses.color_pair(2) | curses.A_BOLD if active else curses.color_pair(3)
-            self.scr.attron(pair)
+        for i, (key, label, _, _) in enumerate(TABS):
+            is_active  = i == active_idx
+            is_focused = (self.focus_level == self.FOCUS_TABBAR and i == self.tab_cursor)
+            tag = f"[{key}] {label}"
+
+            if is_focused:
+                self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+            elif is_active:
+                self.scr.attron(curses.color_pair(2) | curses.A_BOLD)
+            else:
+                self.scr.attron(curses.color_pair(3))
+
             try:
                 self.scr.addstr(1, x, tag)
             except Exception:
                 pass
-            self.scr.attroff(pair)
+
+            if is_focused:
+                self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+            elif is_active:
+                self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+            else:
+                self.scr.attroff(curses.color_pair(3))
+
             x += len(tag) + 2
+
+    def _do_delete_file(self):
+        """Delete the target file from cloud and remove from local list."""
+        f     = self.del_file_target
+        self.del_file_step   = 0
+        self.del_file_target = None
+        if not f:
+            return
+        uuid  = f.get("uuid", "")
+        title = f.get("title", "")
+        self.status(f"Deleting {title}...")
+        def _delete():
+            try:
+                self.api.delete_file(uuid)
+                self.files_items = [x for x in self.files_items if x.get("uuid") != uuid]
+                self.f_cursor    = min(self.f_cursor, max(0, len(self.files_items) - 1))
+                self.status(f"Deleted {title}.")
+            except Exception as e:
+                self.status(f"Delete error: {e}", error=True)
+        threading.Thread(target=_delete, daemon=True).start()
+
+    def _draw_delete_file_overlay(self):
+        """Overlay for file delete confirmation (1 or 2 steps)."""
+        if self.del_file_step == 0 or not self.del_file_target:
+            return
+        h, w  = self.scr.getmaxyx()
+        f     = self.del_file_target
+        title = f.get("title", "this file")
+        dur   = int(f.get("duration", 0) or 0)
+        pos   = int(f.get("playedUpTo", 0) or 0)
+        stat  = int(f.get("playingStatus", 0) or 0)
+
+        is_second = self.del_file_step == 2
+        played = stat == 3 or (dur and pos >= dur - 30)
+
+        if is_second:
+            warn  = "Not finished! Delete from cloud anyway?"
+            msg   = trunc(title, 44)
+            ow    = max(len(warn) + 8, len(msg) + 8, 56)
+            oh    = 7
+        else:
+            msg   = f"Delete from cloud: {trunc(title, 36)}?"
+            ow    = max(len(msg) + 8, 52)
+            oh    = 5
+
+        ox = (w - ow) // 2
+        oy = (h - oh) // 2
+
+        self._overlay_box(oy, ox, oh, ow, title="Delete File?", danger=True)
+
+        try:
+            if is_second:
+                self.scr.attron(curses.color_pair(7) | curses.A_BOLD)
+                self.scr.addstr(oy + 1, ox + 2, trunc(warn, ow - 4))
+                self.scr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                self.scr.addstr(oy + 2, ox + 2, trunc(msg, ow - 4))
+                # Progress hint
+                hint = f"Progress: {fmt_dur(pos)} / {fmt_dur(dur)}" if pos > 5 else "Never played"
+                self.scr.attron(curses.color_pair(3))
+                self.scr.addstr(oy + 3, ox + 2, hint)
+                self.scr.attroff(curses.color_pair(3))
+                brow = oy + 5
+            else:
+                self.scr.addstr(oy + 1, ox + 2, trunc(msg, ow - 4))
+                brow = oy + 3
+        except Exception:
+            pass
+
+        self._draw_badges_at(brow, ox + 2, [("y", "confirm"), ("Esc", "cancel")])
 
     def _draw_separator(self, y, w, label=""):
         line = "─" * w
@@ -1217,25 +1408,65 @@ class PocketTUI:
     # ── Discover view ──
 
     def _draw_discover(self, top, height, w):
-        label        = "Search/Discover:"
-        query_str    = self.discover_query + ("█" if self.discover_searching else "")
-        try:
-            self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
-            self.scr.addstr(top, 2, label)
-            self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
-            self.scr.attron(curses.color_pair(2))
-            self.scr.addstr(top, 2 + len(label) + 1, trunc(f"> {query_str}", w - len(label) - 6))
-            self.scr.attroff(curses.color_pair(2))
-        except Exception:
-            pass
-
-        self._draw_separator(top + 1, w)
-
         list_top = top + 2
         list_h   = height - 2
 
+        if self.discover_searching:
+            # Show search input
+            query_str = self.discover_query + "█"
+            self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
+            try:
+                self.scr.addstr(top, 2, "Search:")
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            self.scr.attron(curses.color_pair(2))
+            try:
+                self.scr.addstr(top, 10, trunc(f"> {query_str}", w - 14))
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(2))
+        else:
+            # Sub-mode bar: Trending / Popular / Featured
+            x = 2
+            for i, (mode, label) in enumerate(DISCOVER_MODES):
+                is_active  = mode == self.discover_list_mode
+                is_focused = (self.focus_level == self.FOCUS_SUBMENU
+                              and i == self.discover_mode_cursor)
+
+                if is_focused:
+                    self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                elif is_active:
+                    self.scr.attron(curses.color_pair(2) | curses.A_BOLD)
+                else:
+                    self.scr.attron(curses.color_pair(3))
+
+                try:
+                    self.scr.addstr(top, x, label)
+                except Exception:
+                    pass
+
+                if is_focused:
+                    self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                elif is_active:
+                    self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+                else:
+                    self.scr.attroff(curses.color_pair(3))
+
+                x += len(label) + 3
+
+            self.scr.attron(curses.color_pair(3))
+            try:
+                hint = "Tab=nav  / search"
+                self.scr.addstr(top, w - len(hint) - 2, hint)
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(3))
+
+        self._draw_separator(top + 1, w)
+
         if not self.discover_results:
-            hint = "Press / to search, Enter to subscribe." if not self.discover_query else "No results."
+            hint = "No results." if self.discover_query else "Loading..."
             self.scr.attron(curses.color_pair(3))
             try:
                 self.scr.addstr(list_top + 1, 2, hint)
@@ -1403,7 +1634,7 @@ class PocketTUI:
             self.VIEW_PODCASTS: [("↑↓", "navigate"), ("Enter", "open"), ("u", "unsub"),  ("/", "search"), ("t", "theme"), ("?", "keys"), ("q", "quit")],
             self.VIEW_EPISODES: [("↑↓", "navigate"), ("Enter", "play"), ("d", "desc"),   ("/", "search"), ("Esc", "back"), ("?", "keys"), ("q", "quit")],
             self.VIEW_QUEUE:    [("↑↓", "navigate"), ("Enter", "play"), ("d", "desc"),   ("?", "keys"), ("q", "quit")],
-            self.VIEW_FILES:    [("↑↓", "navigate"), ("Enter", "play"), ("?", "keys"),   ("q", "quit")],
+            self.VIEW_FILES:    [("↑↓", "navigate"), ("Enter", "play"), ("x", "delete"), ("?", "keys"), ("q", "quit")],
             self.VIEW_DISCOVER: [("↑↓", "navigate"), ("Enter", "subscribe"), ("/", "search"), ("?", "keys"), ("q", "quit")],
         }
         self._draw_badges(y, w, NAV_BADGES.get(self.view, []))
@@ -1529,6 +1760,21 @@ class PocketTUI:
             pass
         self.scr.attroff(curses.color_pair(3))
 
+    def _draw_badges_at(self, y, x, badges):
+        """Draw badges starting at a specific x position (for overlays)."""
+        for label, desc in badges:
+            try:
+                self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                self.scr.addstr(y, x, f" {label} ")
+                self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                x += len(label) + 2
+                self.scr.attron(curses.color_pair(3))
+                self.scr.addstr(y, x, f"{desc} ")
+                self.scr.attroff(curses.color_pair(3))
+                x += len(desc) + 2
+            except Exception:
+                pass
+
     def _draw_desc_overlay(self):
         if not self.show_desc:
             return
@@ -1653,19 +1899,18 @@ class PocketTUI:
 
         KEYS = [
             ("Navigation",       None),
-            ("1",                "Podcasts"),
-            ("2",                "In Progress"),
-            ("3",                "New Episodes"),
-            ("4",                "Starred"),
-            ("5",                "Files / Audiobooks"),
-            ("6",                "Discover / Subscribe"),
+            ("Tab",              "Focus: content → tab bar → sub-menu"),
+            ("Shift+Tab",        "Focus: reverse direction"),
+            ("← →",             "Move between tabs or sub-menu items"),
+            ("Enter",            "Select focused tab / item"),
+            ("1-6",              "Jump directly to tab"),
             ("↑↓ / j k",        "Navigate list"),
             ("PgUp PgDn",        "Jump page"),
-            ("Enter",            "Open / Play"),
-            ("Esc / Backspace",  "Go back"),
+            ("Esc",              "Back / close overlay / lose focus"),
             ("/",                "Search"),
             ("d",                "Episode description"),
             ("u",                "Unsubscribe (Podcasts tab)"),
+            ("x",                "Delete file from cloud (Files tab)"),
             ("",                 None),
             ("Player",           None),
             ("Space / p",        "Play / Pause"),
@@ -1724,20 +1969,7 @@ class PocketTUI:
             self.scr.addstr(oy + 1, ox + 2, trunc(msg, ow - 4))
         except Exception:
             pass
-        # Key badges inline, starting at ox + 2
-        bx = ox + 2
-        for label, desc in [("y", "confirm"), ("Esc", "cancel")]:
-            try:
-                self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
-                self.scr.addstr(oy + 3, bx, f" {label} ")
-                self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
-                bx += len(label) + 2
-                self.scr.attron(curses.color_pair(3))
-                self.scr.addstr(oy + 3, bx, f"{desc} ")
-                self.scr.attroff(curses.color_pair(3))
-                bx += len(desc) + 2
-            except Exception:
-                pass
+        self._draw_badges_at(oy + 3, ox + 2, [("y", "confirm"), ("Esc", "cancel")])
 
     # ─────────────────────────────────────────
     # Input handling
@@ -1746,49 +1978,52 @@ class PocketTUI:
     def handle_key(self, key):
         vis = self._visible_rows()
 
-        # ── q: close overlays first, quit last ──
+        # ── q: close overlays then quit ──
         if key in (ord("q"), ord("Q")):
-            if self.show_desc:
-                self.show_desc = False
+            if self.show_desc:          self.show_desc = False
             elif self.searching:
-                self.searching    = False
-                self.search_query = ""
+                self.searching = False; self.search_query = ""
             elif self.discover_searching:
-                self.discover_searching = False
+                self._close_discover_search()
             elif self.unsub_confirm:
-                self.unsub_confirm = False
-                self.unsub_target  = None
+                self.unsub_confirm = False; self.unsub_target = None
+            elif self.del_file_step > 0:
+                self.del_file_step = 0; self.del_file_target = None
+            elif self.focus_level != self.FOCUS_CONTENT:
+                self.focus_level = self.FOCUS_CONTENT
             else:
-                return False   # quit
+                return False
             return True
 
-        # ── Esc: close overlays in priority order ──
+        # ── Esc: back in priority order ──
         if key == 27:
-            if self.show_keys:        self.show_keys   = False
-            elif self.show_desc:      self.show_desc   = False
-            elif self.show_themes:    self.show_themes  = False
+            if self.show_keys:      self.show_keys  = False
+            elif self.show_desc:    self.show_desc  = False
+            elif self.show_themes:  self.show_themes = False
             elif self.unsub_confirm:
-                self.unsub_confirm = False
-                self.unsub_target  = None
+                self.unsub_confirm = False; self.unsub_target = None
+            elif self.del_file_step > 0:
+                self.del_file_step = 0; self.del_file_target = None
             elif self.searching:
-                self.searching    = False
-                self.search_query = ""
+                self.searching = False; self.search_query = ""
             elif self.discover_searching:
-                self.discover_searching = False
+                self._close_discover_search()
+            elif self.focus_level == self.FOCUS_SUBMENU:
+                self.focus_level = self.FOCUS_CONTENT
+            elif self.focus_level == self.FOCUS_TABBAR:
+                self.focus_level = self.FOCUS_CONTENT
             elif self.view == self.VIEW_EPISODES:
                 self.view = self.VIEW_PODCASTS
             return True
 
-        # ── Capture mode: search overlay ──
+        # ── Capture modes ──
         if self.searching:
             return self._handle_search_key(key)
-
-        # ── Capture mode: discover input ──
         if self.discover_searching:
             self._handle_discover_key(key)
             return True
 
-        # ── Theme overlay navigation ──
+        # ── Overlay captures ──
         if self.show_themes:
             if key in (curses.KEY_DOWN, ord("j")):
                 self.theme_cursor = (self.theme_cursor + 1) % len(self.THEMES)
@@ -1801,23 +2036,66 @@ class PocketTUI:
                 self.status(f"Theme: {self.THEMES[self.current_theme]['name']}")
             return True
 
-        # ── Description overlay scroll ──
         if self.show_desc:
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.desc_offset += 1
-            elif key in (curses.KEY_UP, ord("k")):
-                self.desc_offset = max(0, self.desc_offset - 1)
-            elif key in (ord("d"), ord("q")):
-                self.show_desc = False
+            if key in (curses.KEY_DOWN, ord("j")):   self.desc_offset += 1
+            elif key in (curses.KEY_UP, ord("k")):   self.desc_offset = max(0, self.desc_offset - 1)
+            elif key in (ord("d"), ord("q")):         self.show_desc = False
             return True
 
-        # ── Unsubscribe confirm ──
         if self.unsub_confirm:
-            if key in (ord("y"), ord("Y")):
-                self._do_unsubscribe()
+            if key in (ord("y"), ord("Y")):  self._do_unsubscribe()
             else:
-                self.unsub_confirm = False
-                self.unsub_target  = None
+                self.unsub_confirm = False; self.unsub_target = None
+            return True
+
+        if self.del_file_step > 0:
+            if key in (ord("y"), ord("Y")):
+                if self.del_file_step == 1:
+                    f    = self.del_file_target
+                    dur  = int(f.get("duration", 0) or 0)
+                    pos  = int(f.get("playedUpTo", 0) or 0)
+                    stat = int(f.get("playingStatus", 0) or 0)
+                    if stat == 3 or (dur and pos >= dur - 30):
+                        self._do_delete_file()
+                    else:
+                        self.del_file_step = 2
+                else:
+                    self._do_delete_file()
+            else:
+                self.del_file_step = 0; self.del_file_target = None
+            return True
+
+        # ── Tab / Shift+Tab: cycle focus ──
+        KEY_TAB       = 9
+        KEY_SHIFT_TAB = 353
+
+        if key == KEY_TAB:
+            self._focus_next()
+            return True
+        if key == KEY_SHIFT_TAB:
+            self._focus_prev()
+            return True
+
+        # ── Focus-aware navigation ──
+        if self.focus_level == self.FOCUS_TABBAR:
+            if key in (curses.KEY_RIGHT, ord("l")):
+                self.tab_cursor = (self.tab_cursor + 1) % len(TABS)
+            elif key in (curses.KEY_LEFT, ord("h")):
+                self.tab_cursor = (self.tab_cursor - 1) % len(TABS)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                self._activate_tab(self.tab_cursor)
+            return True
+
+        if self.focus_level == self.FOCUS_SUBMENU and self.view == self.VIEW_DISCOVER:
+            if key in (curses.KEY_RIGHT, ord("l")):
+                self.discover_mode_cursor = (self.discover_mode_cursor + 1) % len(DISCOVER_MODES)
+            elif key in (curses.KEY_LEFT, ord("h")):
+                self.discover_mode_cursor = (self.discover_mode_cursor - 1) % len(DISCOVER_MODES)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                mode = DISCOVER_MODES[self.discover_mode_cursor][0]
+                self.discover_query = ""
+                self.load_discover_list(mode)
+                self.focus_level = self.FOCUS_CONTENT
             return True
 
         # ── Global toggles ──
@@ -1829,7 +2107,13 @@ class PocketTUI:
             self.theme_cursor = self.current_theme
             return True
 
-        # ── Open search (episodes or podcasts tab) ──
+        # ── Number keys: jump to tab ──
+        for i, (k, _, _, _) in enumerate(TABS):
+            if key == ord(k):
+                self._activate_tab(i)
+                return True
+
+        # ── Search ──
         if key == ord("/") and self.view in (self.VIEW_EPISODES, self.VIEW_PODCASTS):
             self.searching          = True
             self.search_query       = ""
@@ -1839,44 +2123,17 @@ class PocketTUI:
             self.pod_search_cursor  = self.pod_search_offset = 0
             return True
 
-        # ── Tab switches ──
-        if key == ord("1"):
-            self.view = self.VIEW_PODCASTS
-            if not self.podcasts:
-                self.load_podcasts()
-            return True
-        if key == ord("2"):
-            self.view       = self.VIEW_QUEUE
-            self.queue_mode = "in_progress"
-            self.load_queue()
-            return True
-        if key == ord("3"):
-            self.view       = self.VIEW_QUEUE
-            self.queue_mode = "new"
-            self.load_queue()
-            return True
-        if key == ord("4"):
-            self.view       = self.VIEW_QUEUE
-            self.queue_mode = "starred"
-            self.load_queue()
-            return True
-        if key == ord("5"):
-            self.view = self.VIEW_FILES
-            if not self.files_items:
-                self.load_files()
-            return True
-        if key == ord("6"):
-            self.view             = self.VIEW_DISCOVER
-            self.subscribed_uuids = {p.get("uuid", "") for p in self.podcasts}
+        if key == ord("/") and self.view == self.VIEW_DISCOVER:
+            self.discover_searching = True
             return True
 
-        # ── Unsubscribe (podcasts tab only) ──
+        # ── Unsubscribe ──
         if key == ord("u") and self.view == self.VIEW_PODCASTS and self.podcasts:
             self.unsub_target  = self.podcasts[self.pod_cursor]
             self.unsub_confirm = True
             return True
 
-        # ── Player controls (always available) ──
+        # ── Player controls ──
         if key in (ord("p"), ord(" ")):
             if self.mpv.is_running():
                 self.mpv.pause_toggle()
@@ -1891,17 +2148,13 @@ class PocketTUI:
             return True
 
         if key == curses.KEY_RIGHT and self.mpv.is_running():
-            self.mpv.seek(30)
-            return True
+            self.mpv.seek(30); return True
         if key == curses.KEY_LEFT and self.mpv.is_running():
-            self.mpv.seek(-30)
-            return True
+            self.mpv.seek(-30); return True
         if key == ord("n") and self.mpv.is_running():
-            self.mpv.next_chapter()
-            return True
+            self.mpv.next_chapter(); return True
         if key == ord("N") and self.mpv.is_running():
-            self.mpv.prev_chapter()
-            return True
+            self.mpv.prev_chapter(); return True
         if key == ord("]") and self.mpv.is_running():
             self.speed_idx = min(len(SPEEDS) - 1, self.speed_idx + 1)
             self.mpv.set_speed(SPEEDS[self.speed_idx])
@@ -1945,8 +2198,7 @@ class PocketTUI:
             elif key in (curses.KEY_BACKSPACE, 127, ord("b")):
                 self.view = self.VIEW_PODCASTS
             elif key == ord("d"):
-                self.show_desc   = True
-                self.desc_offset = 0
+                self.show_desc = True; self.desc_offset = 0
 
         elif self.view == self.VIEW_QUEUE:
             if key in (curses.KEY_DOWN, ord("j")):
@@ -1958,12 +2210,11 @@ class PocketTUI:
             elif key == curses.KEY_PPAGE:
                 self.q_cursor, self.q_offset = self._scroll(self.q_cursor, self.q_offset, -vis, len(self.queue_items), vis)
             elif key in (curses.KEY_ENTER, 10, 13) and self.queue_items:
-                ep      = self.queue_items[self.q_cursor]
+                ep       = self.queue_items[self.q_cursor]
                 pod_uuid = ep.get("podcastUuid") or ep.get("podcast_uuid") or ep.get("podcast")
                 self.play({"uuid": pod_uuid, "title": ep.get("podcastTitle", "")}, ep)
             elif key == ord("d"):
-                self.show_desc   = True
-                self.desc_offset = 0
+                self.show_desc = True; self.desc_offset = 0
 
         elif self.view == self.VIEW_FILES:
             if key in (curses.KEY_DOWN, ord("j")):
@@ -1976,22 +2227,67 @@ class PocketTUI:
                 self.f_cursor, self.f_offset = self._scroll(self.f_cursor, self.f_offset, -vis, len(self.files_items), vis)
             elif key in (curses.KEY_ENTER, 10, 13) and self.files_items:
                 self.play_file(self.files_items[self.f_cursor])
+            elif key == ord("x") and self.files_items:
+                self.del_file_target = self.files_items[self.f_cursor]
+                self.del_file_step   = 1
 
         elif self.view == self.VIEW_DISCOVER:
-            if key == ord("/"):
-                self.discover_searching = True
-            elif key in (curses.KEY_DOWN, ord("j")):
-                self.discover_cursor, self.discover_offset = self._scroll(self.discover_cursor, self.discover_offset,  1, len(self.discover_results), vis - 2)
+            list_vis = self._visible_rows() - 2
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, 1, len(self.discover_results), list_vis)
             elif key in (curses.KEY_UP, ord("k")):
-                self.discover_cursor, self.discover_offset = self._scroll(self.discover_cursor, self.discover_offset, -1, len(self.discover_results), vis - 2)
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, -1, len(self.discover_results), list_vis)
             elif key == curses.KEY_NPAGE:
-                self.discover_cursor, self.discover_offset = self._scroll(self.discover_cursor, self.discover_offset,  vis - 2, len(self.discover_results), vis - 2)
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, list_vis, len(self.discover_results), list_vis)
             elif key == curses.KEY_PPAGE:
-                self.discover_cursor, self.discover_offset = self._scroll(self.discover_cursor, self.discover_offset, -(vis - 2), len(self.discover_results), vis - 2)
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, -list_vis, len(self.discover_results), list_vis)
             elif key in (curses.KEY_ENTER, 10, 13) and self.discover_results:
                 self._do_subscribe(self.discover_results[self.discover_cursor])
 
         return True
+
+    def _has_submenu(self):
+        """True if current view has a sub-menu level."""
+        return self.view == self.VIEW_DISCOVER
+
+    def _focus_next(self):
+        """Tab: advance focus level."""
+        if self.focus_level == self.FOCUS_CONTENT:
+            self.tab_cursor  = self._current_tab_idx()
+            self.focus_level = self.FOCUS_TABBAR
+        elif self.focus_level == self.FOCUS_TABBAR:
+            if self._has_submenu():
+                self.focus_level = self.FOCUS_SUBMENU
+            else:
+                self.focus_level = self.FOCUS_CONTENT
+        elif self.focus_level == self.FOCUS_SUBMENU:
+            self.focus_level = self.FOCUS_CONTENT
+
+    def _focus_prev(self):
+        """Shift+Tab: retreat focus level."""
+        if self.focus_level == self.FOCUS_CONTENT:
+            if self._has_submenu():
+                self.focus_level = self.FOCUS_SUBMENU
+            else:
+                self.tab_cursor  = self._current_tab_idx()
+                self.focus_level = self.FOCUS_TABBAR
+        elif self.focus_level == self.FOCUS_TABBAR:
+            self.focus_level = self.FOCUS_CONTENT
+        elif self.focus_level == self.FOCUS_SUBMENU:
+            self.tab_cursor  = self._current_tab_idx()
+            self.focus_level = self.FOCUS_TABBAR
+
+    def _close_discover_search(self):
+        """Close discover search and restore curated list."""
+        self.discover_searching = False
+        self.discover_query     = ""
+        m = self.discover_list_mode
+        self.discover_results   = self.discover_lists.get(m, [])
+        self.discover_cursor    = self.discover_offset = 0
 
     def _handle_search_key(self, key):
         is_ep = self.view == self.VIEW_EPISODES
@@ -2044,6 +2340,9 @@ class PocketTUI:
             self._update_discover_results()
         elif key == 27:
             self.discover_searching = False
+            if not self.discover_query:
+                m = self.discover_list_mode
+                self.discover_results = self.discover_lists.get(m, [])
         elif key in (curses.KEY_ENTER, 10, 13):
             if self.discover_results:
                 self._do_subscribe(self.discover_results[self.discover_cursor])
@@ -2074,7 +2373,12 @@ class PocketTUI:
 
     def _visible_rows(self):
         h, _ = self.scr.getmaxyx()
-        player_h = 4 if (self.mpv.is_running() or self.playing_ep) else 0
+        # Layout: row 0=header, 1=tabs, 2=separator → content starts at 3
+        # Footer: 1 row always
+        # Player: separator(1) + player(4) + footer already counted = 5 extra
+        # Matches draw(): player_h=6 includes separator, player draws at h-player_h
+        # content_h = h - 3 - player_h - 1
+        player_h = 6 if (self.mpv.is_running() or self.playing_ep) else 0
         return h - 3 - player_h - 1
 
     # ─────────────────────────────────────────
