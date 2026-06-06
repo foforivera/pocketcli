@@ -4,8 +4,8 @@ pocketcli TUI - interfaz interactiva para Pocket Casts
 Navega podcasts, episodios y reproduce con sync bidireccional
 """
 
-VERSION = "1.5.0"
-BUILD   = "2026-06-05"
+VERSION = "1.6.0"
+BUILD   = "2026-06-06"
 
 import os
 import re
@@ -370,6 +370,14 @@ class API:
         except Exception:
             pass
 
+    def subscribe_podcast(self, podcast_uuid):
+        """Suscribirse a un podcast por UUID."""
+        return self._post("/user/podcast/subscribe", {"uuid": podcast_uuid})
+
+    def unsubscribe_podcast(self, podcast_uuid):
+        """Desuscribirse de un podcast por UUID."""
+        return self._post("/user/podcast/unsubscribe", {"uuid": podcast_uuid})
+
 
 # ─────────────────────────────────────────────
 # MPV IPC
@@ -560,6 +568,7 @@ class PocketTUI:
     VIEW_QUEUE     = "queue"     # in_progress / new / starred
     VIEW_FILES     = "files"
     VIEW_PLAYER    = "player"
+    VIEW_DISCOVER  = "discover"
 
     SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
 
@@ -608,6 +617,19 @@ class PocketTUI:
         self.pod_search_offset  = 0
         self.show_themes        = False
         self.theme_cursor       = 0
+
+        # Discover / Subscribe state
+        self.discover_query      = ""
+        self.discover_results    = []
+        self.discover_cursor     = 0
+        self.discover_offset     = 0
+        self.discover_searching  = False   # input mode active in discover tab
+        self.subscribed_uuids    = set()   # set of subscribed podcast uuids for quick lookup
+        self._discover_search_thread = None
+
+        # Unsubscribe confirm state
+        self.unsub_confirm       = False   # overlay visible
+        self.unsub_target        = None    # podcast dict to unsubscribe
 
         # Cargar temas desde TOML (builtin + usuario)
         self.THEMES = _load_themes()
@@ -665,6 +687,7 @@ class PocketTUI:
                 pods = self.api.subscribed_podcasts()
                 pods.sort(key=lambda p: p.get("title", "").lower())
                 self.podcasts = pods
+                self.subscribed_uuids = {p.get("uuid", "") for p in pods}
                 self.status("")
             except Exception as e:
                 self.status(f"Error: {e}", error=True)
@@ -891,6 +914,7 @@ class PocketTUI:
         self._draw_search_overlay()
         self._draw_keymap_overlay()
         self._draw_theme_overlay()
+        self._draw_unsub_confirm_overlay()
         self.scr.refresh()
 
     def _now_playing_label(self):
@@ -920,6 +944,7 @@ class PocketTUI:
             ("3", "New",      self.VIEW_QUEUE if self.queue_mode == "new" else None),
             ("4", "Starred",   self.VIEW_QUEUE if self.queue_mode == "starred" else None),
             ("5", "Files",       self.VIEW_FILES),
+            ("6", "Discover",    self.VIEW_DISCOVER),
         ]
         x = 1
         for key, label, vcheck in views:
@@ -929,7 +954,8 @@ class PocketTUI:
                 (self.view == self.VIEW_QUEUE and self.queue_mode == "in_progress" and key == "2") or
                 (self.view == self.VIEW_QUEUE and self.queue_mode == "new" and key == "3") or
                 (self.view == self.VIEW_QUEUE and self.queue_mode == "starred" and key == "4") or
-                (self.view == self.VIEW_FILES and key == "5")
+                (self.view == self.VIEW_FILES and key == "5") or
+                (self.view == self.VIEW_DISCOVER and key == "6")
             )
             tag = f"[{key}] {label}"
             if active:
@@ -1136,7 +1162,7 @@ class PocketTUI:
             return
         h, w = self.scr.getmaxyx()
         ow = min(w - 6, 60)
-        oh = 28
+        oh = 30
         ox = (w - ow) // 2
         oy = max(1, (h - oh) // 2)
 
@@ -1147,12 +1173,14 @@ class PocketTUI:
             ("3", "New Episodes"),
             ("4", "Starred"),
             ("5", "Files / Audiobooks"),
+            ("6", "Discover / Subscribe"),
             ("↑↓ / j k", "Navigate list"),
             ("PgUp PgDn", "Jump page"),
             ("Enter", "Open / Play"),
             ("Esc / Backspace", "Go back"),
             ("/ ", "Search"),
             ("d", "Episode description"),
+            ("u", "Unsubscribe (Podcasts tab)"),
             ("", None),
             ("Player", None),
             ("Space / p", "Play / Pause"),
@@ -1336,6 +1364,118 @@ class PocketTUI:
             pass
         self.scr.attroff(curses.color_pair(3))
 
+    def _draw_discover(self, top, height, w):
+        """Dibuja el tab Discover con input de busqueda y resultados."""
+        # Search bar at top
+        bar_label = "Search/Discover:"
+        query_display = self.discover_query + ("█" if self.discover_searching else "")
+        try:
+            self.scr.attron(curses.color_pair(1) | curses.A_BOLD)
+            self.scr.addstr(top, 2, bar_label)
+            self.scr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            self.scr.attron(curses.color_pair(2))
+            self.scr.addstr(top, 2 + len(bar_label) + 1, trunc(f"> {query_display}", w - len(bar_label) - 6))
+            self.scr.attroff(curses.color_pair(2))
+        except Exception:
+            pass
+
+        # Separator
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(top + 1, 0, "─" * w)
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
+        list_top  = top + 2
+        list_h    = height - 2
+
+        if not self.discover_results:
+            self.scr.attron(curses.color_pair(3))
+            hint = "Press / or just type to search. Enter to subscribe." if not self.discover_query else "No results."
+            try:
+                self.scr.addstr(list_top + 1, 2, hint)
+            except Exception:
+                pass
+            self.scr.attroff(curses.color_pair(3))
+            return
+
+        visible = self.discover_results[self.discover_offset: self.discover_offset + list_h]
+        for i, pod in enumerate(visible):
+            idx = self.discover_offset + i
+            sel = idx == self.discover_cursor
+            already = pod.get("uuid", "") in self.subscribed_uuids
+            indicator = "✓" if already else "+"
+            col_ind   = curses.color_pair(2) if already else curses.color_pair(1)
+            title  = trunc(pod.get("title", ""), w - 24)
+            author = trunc(pod.get("author", ""), 18)
+            line   = f"  {indicator} {title:<{w - 26}} {author}"
+            try:
+                if sel:
+                    self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                    self.scr.addstr(list_top + i, 0, trunc(line, w))
+                    self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                else:
+                    self.scr.addstr(list_top + i, 0, trunc(line, w))
+                    self.scr.attron(col_ind | curses.A_BOLD)
+                    self.scr.addstr(list_top + i, 2, indicator)
+                    self.scr.attroff(col_ind | curses.A_BOLD)
+            except Exception:
+                pass
+
+        # Scrollbar
+        if len(self.discover_results) > list_h:
+            bar_h   = max(1, list_h * list_h // len(self.discover_results))
+            bar_pos = int(list_h * self.discover_offset / len(self.discover_results))
+            for y in range(list_h):
+                char = "█" if bar_pos <= y < bar_pos + bar_h else "░"
+                try:
+                    self.scr.addstr(list_top + y, w - 1, char, curses.color_pair(3))
+                except Exception:
+                    pass
+
+    def _draw_unsub_confirm_overlay(self):
+        """Overlay de confirmacion para desuscribirse."""
+        if not self.unsub_confirm or not self.unsub_target:
+            return
+        h, w = self.scr.getmaxyx()
+        title = self.unsub_target.get("title", "this podcast")
+        msg   = f"Unsubscribe from: {trunc(title, 40)}?"
+        ow    = max(len(msg) + 8, 50)
+        oh    = 5
+        ox    = (w - ow) // 2
+        oy    = (h - oh) // 2
+
+        for y in range(oh):
+            try:
+                if y == 0 or y == oh - 1:
+                    self.scr.attron(curses.color_pair(7))
+                    self.scr.addstr(oy + y, ox, "─" * ow)
+                    self.scr.attroff(curses.color_pair(7))
+                else:
+                    self.scr.addstr(oy + y, ox, "│" + " " * (ow - 2) + "│")
+            except Exception:
+                pass
+
+        self.scr.attron(curses.color_pair(7) | curses.A_BOLD)
+        try:
+            self.scr.addstr(oy, ox + 2, "┤ Unsubscribe? ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(7) | curses.A_BOLD)
+
+        try:
+            self.scr.addstr(oy + 1, ox + 2, trunc(msg, ow - 4))
+        except Exception:
+            pass
+
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(oy + 3, ox + 2, "┤ y = confirm   n / Esc = cancel ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
     def _draw_separator(self, y, w, label=""):
         line = "─" * w
         if label:
@@ -1393,6 +1533,8 @@ class PocketTUI:
                     self._file_right(f),
                 ),
             )
+        elif self.view == self.VIEW_DISCOVER:
+            self._draw_discover(top, height, w)
 
     def _draw_list(self, top, height, w, items, cursor, offset, fmt):
         if not items:
@@ -1571,10 +1713,11 @@ class PocketTUI:
 
         # Nav badges
         nav_badges = {
-            self.VIEW_PODCASTS:  [("↑↓", "navigate"), ("Enter", "open"), ("/", "search"), ("t", "theme"), ("?", "keys"), ("q", "quit")],
+            self.VIEW_PODCASTS:  [("↑↓", "navigate"), ("Enter", "open"), ("u", "unsub"), ("/", "search"), ("t", "theme"), ("?", "keys"), ("q", "quit")],
             self.VIEW_EPISODES:  [("↑↓", "navigate"), ("Enter", "play"), ("/", "search"), ("d", "desc"), ("Esc", "back"), ("?", "keys"), ("q", "quit")],
             self.VIEW_QUEUE:     [("↑↓", "navigate"), ("Enter", "play"), ("d", "desc"), ("?", "keys"), ("q", "quit")],
             self.VIEW_FILES:     [("↑↓", "navigate"), ("Enter", "play"), ("?", "keys"), ("q", "quit")],
+            self.VIEW_DISCOVER:  [("↑↓", "navigate"), ("Enter", "subscribe"), ("/", "search"), ("?", "keys"), ("q", "quit")],
         }
         badges = nav_badges.get(self.view, [])
         self._draw_badges(y, w, badges)
@@ -1701,6 +1844,107 @@ class PocketTUI:
 
     # ── Navigation helpers ────────────────────
 
+    def _handle_discover_key(self, key):
+        """Maneja teclas en el input de busqueda del tab Discover."""
+        if key in (curses.KEY_BACKSPACE, 127):
+            self.discover_query = self.discover_query[:-1]
+            self._update_discover_results()
+        elif key == 27:  # Esc
+            self.discover_searching = False
+        elif key in (curses.KEY_ENTER, 10, 13):
+            # Subscribe to selected result
+            if self.discover_results:
+                self._do_subscribe(self.discover_results[self.discover_cursor])
+            self.discover_searching = False
+        elif key == curses.KEY_DOWN:
+            h, _ = self.scr.getmaxyx()
+            vis   = max(1, h - 8)
+            self.discover_cursor, self.discover_offset = self._scroll(
+                self.discover_cursor, self.discover_offset, 1, len(self.discover_results), vis - 2)
+        elif key == curses.KEY_UP:
+            h, _ = self.scr.getmaxyx()
+            vis   = max(1, h - 8)
+            self.discover_cursor, self.discover_offset = self._scroll(
+                self.discover_cursor, self.discover_offset, -1, len(self.discover_results), vis - 2)
+        elif 32 <= key <= 126:
+            self.discover_query += chr(key)
+            self._update_discover_results()
+
+    def _update_discover_results(self):
+        """Lanza busqueda en background y actualiza discover_results."""
+        q = self.discover_query.strip()
+        if len(q) < 2:
+            self.discover_results = []
+            self.discover_cursor  = 0
+            self.discover_offset  = 0
+            return
+
+        self.status("Searching...")
+
+        def _search():
+            try:
+                results = self.api.search_podcasts(q)
+                self.discover_results = results
+                self.discover_cursor  = 0
+                self.discover_offset  = 0
+                self.status(f"{len(results)} results for '{q}'" if results else "No results.")
+            except Exception as e:
+                self.status(f"Search error: {e}", error=True)
+
+        threading.Thread(target=_search, daemon=True).start()
+
+    def _do_subscribe(self, pod):
+        """Suscribirse a un podcast del discover. Actualiza la lista local."""
+        uuid = pod.get("uuid", "")
+        if not uuid:
+            self.status("Cannot subscribe: no UUID.", error=True)
+            return
+        if uuid in self.subscribed_uuids:
+            self.status(f"Already subscribed to {pod.get('title', '')}")
+            return
+
+        self.status(f"Subscribing to {pod.get('title', '')}...")
+
+        def _sub():
+            try:
+                self.api.subscribe_podcast(uuid)
+                self.subscribed_uuids.add(uuid)
+                # Reload podcast list in background
+                pods = self.api.subscribed_podcasts()
+                pods.sort(key=lambda p: p.get("title", "").lower())
+                self.podcasts = pods
+                self.status(f"Subscribed to {pod.get('title', '')}!")
+            except Exception as e:
+                self.status(f"Subscribe error: {e}", error=True)
+
+        threading.Thread(target=_sub, daemon=True).start()
+
+    def _do_unsubscribe(self):
+        """Desuscribirse del podcast seleccionado en el tab Podcasts."""
+        pod = self.unsub_target
+        self.unsub_confirm = False
+        self.unsub_target  = None
+        if not pod:
+            return
+        uuid  = pod.get("uuid", "")
+        title = pod.get("title", "")
+        self.status(f"Unsubscribing from {title}...")
+
+        def _unsub():
+            try:
+                self.api.unsubscribe_podcast(uuid)
+                # Remove from local list immediately
+                self.podcasts = [p for p in self.podcasts if p.get("uuid") != uuid]
+                self.subscribed_uuids.discard(uuid)
+                # Clamp cursor
+                if self.pod_cursor >= len(self.podcasts):
+                    self.pod_cursor = max(0, len(self.podcasts) - 1)
+                self.status(f"Unsubscribed from {title}.")
+            except Exception as e:
+                self.status(f"Unsubscribe error: {e}", error=True)
+
+        threading.Thread(target=_unsub, daemon=True).start()
+
     def _scroll(self, cursor, offset, delta, total, visible):
         cursor = max(0, min(total - 1, cursor + delta))
         if cursor < offset:
@@ -1729,6 +1973,13 @@ class PocketTUI:
                 self.searching = False
                 self.search_query = ""
                 return True
+            if self.discover_searching:
+                self.discover_searching = False
+                return True
+            if self.unsub_confirm:
+                self.unsub_confirm = False
+                self.unsub_target  = None
+                return True
             return False  # quit
 
         if key == 27:  # Esc
@@ -1736,9 +1987,14 @@ class PocketTUI:
                 self.show_keys = False
             elif self.show_desc:
                 self.show_desc = False
+            elif self.unsub_confirm:
+                self.unsub_confirm = False
+                self.unsub_target  = None
             elif self.searching:
                 self.searching    = False
                 self.search_query = ""
+            elif self.discover_searching:
+                self.discover_searching = False
             elif self.view == self.VIEW_EPISODES:
                 self.view = self.VIEW_PODCASTS
             return True
@@ -1789,6 +2045,11 @@ class PocketTUI:
         if self.searching:
             return self._handle_search_key(key)
 
+        # Discover input mode: capture ALL keystrokes
+        if self.discover_searching:
+            self._handle_discover_key(key)
+            return True
+
         # Open search with /
         if key == ord("/") and self.view in (self.VIEW_EPISODES, self.VIEW_PODCASTS):
             self.searching      = True
@@ -1829,6 +2090,28 @@ class PocketTUI:
             self.view = self.VIEW_FILES
             if not self.files_items:
                 self.load_files()
+            return True
+
+        if key == ord("6"):
+            self.view = self.VIEW_DISCOVER
+            # Refresh subscribed uuids for indicators
+            self.subscribed_uuids = {p.get("uuid", "") for p in self.podcasts}
+            return True
+
+        # Unsubscribe - only from podcasts view (podcast list, not episodes)
+        if key == ord("u") and self.view == self.VIEW_PODCASTS and not self.searching:
+            if self.podcasts:
+                self.unsub_target  = self.podcasts[self.pod_cursor]
+                self.unsub_confirm = True
+            return True
+
+        # Unsubscribe confirm overlay keys
+        if self.unsub_confirm:
+            if key in (ord("y"), ord("Y")):
+                self._do_unsubscribe()
+            else:
+                self.unsub_confirm = False
+                self.unsub_target  = None
             return True
 
         # Player controls (always available)
@@ -1976,6 +2259,26 @@ class PocketTUI:
             elif key in (curses.KEY_ENTER, 10, 13):
                 if self.files_items:
                     self.play_file(self.files_items[self.f_cursor])
+
+        # Discover view
+        elif self.view == self.VIEW_DISCOVER:
+            if key == ord("/"):
+                self.discover_searching = True
+            elif key == curses.KEY_DOWN or key == ord("j"):
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, 1, len(self.discover_results), vis - 2)
+            elif key == curses.KEY_UP or key == ord("k"):
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, -1, len(self.discover_results), vis - 2)
+            elif key == curses.KEY_NPAGE:
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, vis - 2, len(self.discover_results), vis - 2)
+            elif key == curses.KEY_PPAGE:
+                self.discover_cursor, self.discover_offset = self._scroll(
+                    self.discover_cursor, self.discover_offset, -(vis - 2), len(self.discover_results), vis - 2)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if self.discover_results:
+                    self._do_subscribe(self.discover_results[self.discover_cursor])
 
         return True
 
