@@ -1,28 +1,46 @@
 # Changelog
 
+## [1.8.0] - 2026-06-09
+
+### Added
+- **Sleep timer** — press `z` to open a menu with 5 / 15 / 30 / 60 minute options; navigated with `↑↓` and `Enter`
+- **Sleep countdown** — displays `Sleep: 14:32` right-justified in the player bar while timer is active
+- **Cancel timer** — press `z` again while a timer is running to cancel it from the same menu
+- **Theme colors in lists** — all list items now use the theme's `fg` color for text and `info` color for dates and durations; switching themes is now visually distinct across the entire UI
+
+### Changed
+- Sleep timer pauses mpv and syncs position when it fires — does not close the app
+- List item text uses `color_pair(8)` (theme fg) instead of plain terminal white
+- Right-side metadata (duration, date, author) uses `color_pair(3)` (theme info/yellow)
+- Episode and file indicators (●◐○) retain their semantic colors (green/yellow/dim)
+- Discover list title and author also respect theme colors
+
+### Fixed
+- VERSION bump now part of release checklist — header always reflects the current release
+
 ## [1.7.0] - 2026-06-06
 
 ### Added
 - **Tab navigation** — `Tab` cycles focus between content, tab bar, and sub-menu (Discover); `Shift+Tab` goes backwards
-- **Visual tab focus** — focused tab shows as reverse highlight, active tab stays green; clear distinction between "where you are" and "where the cursor is"
-- **Discover sub-menu navigation** — when focus is on the Discover sub-menu, `←` `→` move between Trending / Popular / Featured; `Enter` loads the selected list
-- **Curated lists in Discover** — Trending, Popular, and Featured load automatically from `lists.pocketcasts.com` when entering the Discover tab; no search needed to browse
+- **Visual tab focus** — focused tab shows as reverse highlight, active tab stays green
+- **Discover sub-menu navigation** — `←` `→` move between Trending / Popular / Featured when sub-menu is focused; `Enter` loads the selected list
+- **Curated lists in Discover** — Trending, Popular, and Featured load automatically from `lists.pocketcasts.com` when entering the Discover tab
 - **Delete file from cloud** — press `x` on any file in the Files tab to delete it from Pocket Casts cloud storage
 - **Smart delete confirmation** — played files (●) get a single confirm; unplayed or in-progress files (○ ◐) get a two-step confirm with progress shown
 
 ### Changed
-- `TABS` and `DISCOVER_MODES` extracted as top-level constants — single source of truth for tab definitions
-- `_activate_tab()` centralizes all tab-switching logic including data loading
-- `_current_tab_idx()` derives the active tab index from app state instead of a separate variable
-- `_close_discover_search()` eliminates duplicated close logic across `q`, `Esc`, and the key handler
-- `from datetime import datetime` moved to top-level imports — no lazy imports inside methods
-- Discover list visible rows calculated via `_visible_rows() - 2` instead of a hardcoded offset
-- `f`, `p`, `e` keybinds removed from Discover — Tab navigation replaces them cleanly
-- `_draw_badges_at(y, x, badges)` helper added for overlay badge rows at arbitrary positions
+- `TABS` and `DISCOVER_MODES` extracted as top-level constants
+- `_activate_tab()` centralizes all tab-switching logic
+- `_current_tab_idx()` derives the active tab index from app state
+- `_close_discover_search()` eliminates duplicated close logic
+- `from datetime import datetime` moved to top-level imports
+- Discover visible rows calculated via `_visible_rows() - 2` instead of hardcoded offset
+- `f`, `p`, `e` keybinds removed from Discover — Tab navigation replaces them
+- `_draw_badges_at(y, x, badges)` helper added for overlay badge rows
 
 ### Fixed
-- Cursor scroll bug: `_visible_rows()` used `player_h=4` but `draw()` reserved `player_h=6`; cursor went invisible 2 rows before scroll triggered
-- Discover key handler used hardcoded `h - 8` for visible rows; now uses `_visible_rows()` consistently
+- Cursor scroll bug: `_visible_rows()` used `player_h=4` but `draw()` reserved `player_h=6`
+- Discover key handler used hardcoded `h - 8` for visible rows; now uses `_visible_rows()`
 
 ## [1.6.1] - 2026-06-06
 
@@ -43,18 +61,16 @@
 - All data loading (queue, files) now runs in background threads — UI stays responsive
 - `sync_episode` and `sync_file` are now separate API methods with cleaner names
 - `_push_sync` helper eliminates duplicated sync logic across pause, periodic sync, and exit
-- `SILENCE_FILTERS` moved to a top-level dict constant — cleaner MPV launch code
-- All imports moved to top level (no more imports inside methods)
+- `SILENCE_FILTERS` moved to a top-level dict constant
+- All imports moved to top level
 - `_itunes_search` extracted as shared API helper
-- Separate `httpx.Client` for external API calls (no auth header conflicts)
+- Separate `httpx.Client` for external API calls
 - `_overlay_box` helper shared across all overlays
-- `_draw_tabs` rewritten with a declarative list of tuples
-- `load_queue` and `load_files` moved to background threads
 - 271 fewer lines overall with no functionality removed
 
 ### Fixed
 - `q` key now correctly closes discover input and unsub confirm before quitting
-- `discover_searching` captured before global keys — no interference with `t`, `?`, `p`, `S`, etc.
+- `discover_searching` captured before global keys
 - `_apply_theme` was called twice on init — now called once
 - `_scroll` now handles `total == 0` without errors
 

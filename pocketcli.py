@@ -4,8 +4,8 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.7.0"
-BUILD   = "2026-06-06"
+VERSION = "1.8.0"
+BUILD   = "2026-06-09"
 
 import os
 import re
@@ -678,6 +678,9 @@ class PocketTUI:
         self.speed_idx    = 2        # index into SPEEDS; default 1.0x
         self.skip_silence = 0        # 0=off 1=normal 2=medium 3=aggressive
         self.last_sync    = 0
+        self.sleep_timer_end  = 0    # epoch when timer fires, 0=inactive
+        self.show_sleep_menu  = False
+        self.sleep_cursor     = 0
 
         # ── Overlays ──
         self.show_desc   = False
@@ -950,6 +953,17 @@ class PocketTUI:
             self.last_sync = now
             self._push_sync(self.mpv.get_position())
 
+    def check_sleep_timer(self):
+        """Pause playback when sleep timer expires."""
+        if not self.sleep_timer_end or not self.mpv.is_running():
+            return
+        if time.time() >= self.sleep_timer_end:
+            self.sleep_timer_end = 0
+            if self.mpv.is_running():
+                self._push_sync(self.mpv.get_position())
+                self.mpv.pause_toggle()
+                self.status("Sleep timer — paused.")
+
     def check_finished(self):
         """Mark episode as played when mpv exits naturally."""
         if not self.mpv.is_running() and self.playing_ep and self.mpv.proc is not None:
@@ -1121,6 +1135,7 @@ class PocketTUI:
         self._draw_search_overlay()
         self._draw_theme_overlay()
         self._draw_keymap_overlay()
+        self._draw_sleep_menu_overlay()
         self._draw_unsub_confirm_overlay()
         self._draw_delete_file_overlay()
 
@@ -1350,7 +1365,19 @@ class PocketTUI:
                     self.scr.addstr(y, 0, trunc(line, w))
                     self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
                 else:
-                    self.scr.addstr(y, 0, trunc(line, w))
+                    # Left text: use theme fg (pair 8)
+                    self.scr.attron(curses.color_pair(8))
+                    self.scr.addstr(y, 0, f" {left:<{left_w}} ")
+                    self.scr.attroff(curses.color_pair(8))
+                    # Right text: use theme info/yellow (pair 3) - dates, durations
+                    if right:
+                        self.scr.attron(curses.color_pair(3))
+                        try:
+                            self.scr.addstr(y, 1 + left_w + 1, f"{right} ")
+                        except Exception:
+                            pass
+                        self.scr.attroff(curses.color_pair(3))
+                    # Indicator override for episodes/files
                     if self.view in (self.VIEW_EPISODES, self.VIEW_FILES):
                         stat = item.get("playingStatus", 0) or 0
                         pos  = item.get("playedUpTo", 0) or 0
@@ -1360,7 +1387,7 @@ class PocketTUI:
                         elif pos and int(pos) > 5:
                             col = curses.color_pair(3)
                         else:
-                            col = curses.A_DIM
+                            col = curses.color_pair(8) | curses.A_DIM
                         self.scr.addstr(y, 1, left[0], col)
             except Exception:
                 pass
@@ -1490,7 +1517,18 @@ class PocketTUI:
                     self.scr.addstr(list_top + i, 0, trunc(line, w))
                     self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
                 else:
+                    # Title in theme fg
+                    self.scr.attron(curses.color_pair(8))
                     self.scr.addstr(list_top + i, 0, trunc(line, w))
+                    self.scr.attroff(curses.color_pair(8))
+                    # Author in info color
+                    self.scr.attron(curses.color_pair(3))
+                    try:
+                        self.scr.addstr(list_top + i, w - len(author) - 1, author)
+                    except Exception:
+                        pass
+                    self.scr.attroff(curses.color_pair(3))
+                    # Indicator in semantic color
                     self.scr.attron(col_ind | curses.A_BOLD)
                     self.scr.addstr(list_top + i, 2, indicator)
                     self.scr.attroff(col_ind | curses.A_BOLD)
@@ -1592,9 +1630,18 @@ class PocketTUI:
         pct      = int(pos / dur * 100) if dur else 0
         ss_label = ["", "normal", "medium", "aggressive"][self.skip_silence]
         ss_str   = f"  skip:{ss_label}" if self.skip_silence else ""
+        pct_str = f"{pct}% completed{ss_str}"
+        if self.sleep_timer_end:
+            remaining = max(0, int(self.sleep_timer_end - time.time()))
+            tm, ts    = divmod(remaining, 60)
+            sleep_str = f"Sleep: {tm}:{ts:02d}"
+            padding   = max(0, w - len(pct_str) - len(sleep_str) - 2)
+            line3     = f" {pct_str}{' ' * padding}{sleep_str}"
+        else:
+            line3 = f" {pct_str}"
         self.scr.attron(curses.color_pair(3))
         try:
-            self.scr.addstr(top + 2, 1, f"{pct}% completed{ss_str}")
+            self.scr.addstr(top + 2, 0, trunc(line3, w))
         except Exception:
             pass
         self.scr.attroff(curses.color_pair(3))
@@ -1603,7 +1650,7 @@ class PocketTUI:
         self._draw_badges(top + 3, w, [
             ("Spc", "pause"), ("←→", "±30s"), ("n/N", "chapter"),
             ("]", "faster"), ("[", "slower"), ("S", "silence"),
-            ("t", "theme"),  ("?", "keys"),   ("q", "quit"),
+            ("z", "sleep"),  ("t", "theme"),  ("?", "keys"), ("q", "quit"),
         ])
 
     # ── Footer ──
@@ -1891,7 +1938,7 @@ class PocketTUI:
             return
         h, w = self.scr.getmaxyx()
         ow = min(w - 6, 60)
-        oh = 30
+        oh = 34
         ox = (w - ow) // 2
         oy = max(1, (h - oh) // 2)
 
@@ -1918,6 +1965,7 @@ class PocketTUI:
             ("n / N",            "Next / Prev chapter"),
             ("] / [",            "Speed up / down"),
             ("S",                "Cycle skip silence"),
+            ("z",                "Sleep timer — 5/15/30/60 min (↑↓ Enter to select)"),
             ("",                 None),
             ("Other",            None),
             ("t",                "Theme selector"),
@@ -1949,6 +1997,53 @@ class PocketTUI:
         self.scr.attron(curses.color_pair(3))
         try:
             self.scr.addstr(oy + oh - 1, ox + 2, "┤ ? / Esc = close ├")
+        except Exception:
+            pass
+        self.scr.attroff(curses.color_pair(3))
+
+    def _sleep_options(self):
+        """Return current sleep timer options list as (label, minutes)."""
+        opts = [
+            ("5 minutes",  5),
+            ("15 minutes", 15),
+            ("30 minutes", 30),
+            ("60 minutes", 60),
+        ]
+        if self.sleep_timer_end:
+            remaining = max(0, int(self.sleep_timer_end - time.time()))
+            m, s = divmod(remaining, 60)
+            opts.insert(0, (f"Cancel timer ({m}:{s:02d} left)", -1))
+        return opts
+
+    def _draw_sleep_menu_overlay(self):
+        if not self.show_sleep_menu:
+            return
+        h, w    = self.scr.getmaxyx()
+        options = self._sleep_options()
+        ow      = 34
+        oh      = len(options) + 4
+        ox      = (w - ow) // 2
+        oy      = (h - oh) // 2
+
+        self._overlay_box(oy, ox, oh, ow, title="Sleep Timer")
+
+        for i, (label, _) in enumerate(options):
+            sel = i == self.sleep_cursor
+            try:
+                if sel:
+                    self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
+                    self.scr.addstr(oy + 1 + i, ox + 2, f"  {label:<26}")
+                    self.scr.attroff(curses.A_REVERSE | curses.A_BOLD)
+                else:
+                    self.scr.attron(curses.color_pair(3))
+                    self.scr.addstr(oy + 1 + i, ox + 2, f"  {label:<26}")
+                    self.scr.attroff(curses.color_pair(3))
+            except Exception:
+                pass
+
+        self.scr.attron(curses.color_pair(3))
+        try:
+            self.scr.addstr(oy + oh - 1, ox + 2, "┤ ↑↓=nav  Enter=select  Esc=close ├")
         except Exception:
             pass
         self.scr.attroff(curses.color_pair(3))
@@ -1987,6 +2082,8 @@ class PocketTUI:
                 self._close_discover_search()
             elif self.unsub_confirm:
                 self.unsub_confirm = False; self.unsub_target = None
+            elif self.show_sleep_menu:
+                self.show_sleep_menu = False
             elif self.del_file_step > 0:
                 self.del_file_step = 0; self.del_file_target = None
             elif self.focus_level != self.FOCUS_CONTENT:
@@ -2002,6 +2099,8 @@ class PocketTUI:
             elif self.show_themes:  self.show_themes = False
             elif self.unsub_confirm:
                 self.unsub_confirm = False; self.unsub_target = None
+            elif self.show_sleep_menu:
+                self.show_sleep_menu = False
             elif self.del_file_step > 0:
                 self.del_file_step = 0; self.del_file_target = None
             elif self.searching:
@@ -2024,6 +2123,27 @@ class PocketTUI:
             return True
 
         # ── Overlay captures ──
+        if self.show_sleep_menu:
+            options = self._sleep_options()
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.sleep_cursor = (self.sleep_cursor + 1) % len(options)
+            elif key in (curses.KEY_UP, ord("k")):
+                self.sleep_cursor = (self.sleep_cursor - 1) % len(options)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                _, mins = options[self.sleep_cursor]
+                if mins == -1:
+                    self.sleep_timer_end = 0
+                    self.status("Sleep timer cancelled.")
+                elif mins == 0:
+                    pass  # not used anymore
+                else:
+                    self.sleep_timer_end = time.time() + mins * 60
+                    self.status(f"Sleep timer set: {mins} min")
+                self.show_sleep_menu = False
+            elif key in (27, ord("z")):
+                self.show_sleep_menu = False
+            return True
+
         if self.show_themes:
             if key in (curses.KEY_DOWN, ord("j")):
                 self.theme_cursor = (self.theme_cursor + 1) % len(self.THEMES)
@@ -2165,6 +2285,12 @@ class PocketTUI:
             self.mpv.set_speed(SPEEDS[self.speed_idx])
             self.status(f"Speed: {SPEEDS[self.speed_idx]}x")
             return True
+        if key == ord("z"):
+            self.show_sleep_menu = not self.show_sleep_menu
+            if self.show_sleep_menu:
+                self.sleep_cursor = 0
+            return True
+
         if key == ord("S") and self.playing_ep:
             self.skip_silence = (self.skip_silence + 1) % 4
             labels = ["off", "normal", "medium", "aggressive"]
@@ -2448,6 +2574,7 @@ class PocketTUI:
             self.draw()
             self.sync_position()
             self.check_finished()
+            self.check_sleep_timer()
 
             self.scr.timeout(100)
             key = self.scr.getch()

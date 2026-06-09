@@ -21,6 +21,7 @@ Built with Python and `curses`. No Electron. No browser. Just a terminal.
 - **Discover tab** — browse Trending, Popular, and Featured lists; search and subscribe via iTunes
 - **Subscribe / Unsubscribe** — manage your library without opening the app
 - **Delete from cloud** — remove uploaded files from Pocket Casts cloud storage directly from the TUI
+- **Sleep timer** — set a 5, 15, 30, or 60 minute timer; pauses playback and syncs position when it fires
 - **Bidirectional sync** — playback position synced to Pocket Casts every 30s and on exit
 - **Resume on launch** — opens with the last played episode ready to go, press space to continue
 - **Episode status** — ● played, ◐ in progress, ○ not played
@@ -30,7 +31,7 @@ Built with Python and `curses`. No Electron. No browser. Just a terminal.
 - **Files support** — audiobooks and custom uploads with progress tracking
 - **Episode descriptions** — press `d` to read the episode description with chapter breakdown
 - **Search** — press `/` to search episodes or discover new podcasts via iTunes
-- **20 built-in themes** — press `t` to switch; add your own TOML themes to `~/.config/pocketcli/themes/`
+- **20 built-in themes** — press `t` to switch; list items use the theme's colors throughout
 - **Truecolor support** — exact hex colors on compatible terminals, ANSI fallback otherwise
 - **Keymap overlay** — press `?` to see all keybindings
 
@@ -123,6 +124,7 @@ You will be prompted for your Pocket Casts email and password. The auth token is
 | `]` | Speed up |
 | `[` | Speed down |
 | `S` | Cycle skip silence: off → normal → medium → aggressive |
+| `z` | Sleep timer (5 / 15 / 30 / 60 min) |
 | `q` | Quit (saves position) |
 
 ---
@@ -134,6 +136,12 @@ The Discover tab (`6`) shows curated lists from Pocket Casts — no search requi
 - `Tab` to focus the sub-menu, then `←` `→` to switch between **Trending**, **Popular**, and **Featured**
 - Press `/` to search by name or keyword via iTunes
 - Press `Enter` on any result to subscribe; `✓` marks podcasts already in your library
+
+---
+
+## Sleep Timer
+
+Press `z` while playing to open the sleep timer menu. Navigate with `↑↓` and confirm with `Enter`. The countdown shows as `Sleep: 14:32` on the right side of the player bar. Press `z` again to cancel.
 
 ---
 
