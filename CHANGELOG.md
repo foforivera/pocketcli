@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.8.1] - 2026-06-10
+
+### Fixed
+- Files tab now sorts alphabetically by filename instead of API order
+
 ## [1.8.0] - 2026-06-09
 
 ### Added

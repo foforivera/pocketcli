@@ -4,8 +4,8 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.8.0"
-BUILD   = "2026-06-09"
+VERSION = "1.8.1"
+BUILD   = "2026-06-10"
 
 import os
 import re
@@ -842,7 +842,9 @@ class PocketTUI:
         self.status("Loading files...")
         def _load():
             try:
-                self.files_items = self.api.files()
+                files = self.api.files()
+                files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f.get('title', ''))])
+                self.files_items = files
                 self.f_cursor = self.f_offset = 0
                 self.status("")
             except Exception as e:
@@ -2517,7 +2519,8 @@ class PocketTUI:
             in_prog  = self.api.in_progress()
             last_ep  = in_prog[0] if in_prog else None
 
-            files    = self.api.files()
+            files = self.api.files()
+            files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f.get('title', ''))])
             self.files_items = files
 
             with_progress = [f for f in files if (f.get("playedUpTo") or 0) > 5]
