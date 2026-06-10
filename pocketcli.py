@@ -4,7 +4,7 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 BUILD   = "2026-06-10"
 
 import os
@@ -60,9 +60,11 @@ SPEEDS      = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
 
 SILENCE_FILTERS = {
     0: None,
-    1: "lavfi=[silenceremove=start_periods=1:start_silence=0.5:start_threshold=-40dB:stop_periods=1:stop_silence=0.5:stop_threshold=-40dB]",
-    2: "lavfi=[silenceremove=start_periods=1:start_silence=0.3:start_threshold=-35dB:stop_periods=1:stop_silence=0.3:stop_threshold=-35dB]",
-    3: "lavfi=[silenceremove=start_periods=1:start_silence=0.15:start_threshold=-30dB:stop_periods=1:stop_silence=0.15:stop_threshold=-30dB]",
+    # lavfi wrapper required for ffmpeg filters in mpv
+    # stop_periods=-1 prevents mpv from stopping at detected silence at end of file
+    1: "lavfi=[silenceremove=start_periods=1:start_silence=0.5:start_threshold=-40dB:stop_periods=-1:stop_silence=0.5:stop_threshold=-40dB]",
+    2: "lavfi=[silenceremove=start_periods=1:start_silence=0.3:start_threshold=-35dB:stop_periods=-1:stop_silence=0.3:stop_threshold=-35dB]",
+    3: "lavfi=[silenceremove=start_periods=1:start_silence=0.15:start_threshold=-30dB:stop_periods=-1:stop_silence=0.15:stop_threshold=-30dB]",
 }
 
 # ─────────────────────────────────────────────
