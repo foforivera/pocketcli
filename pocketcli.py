@@ -4,7 +4,7 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 BUILD   = "2026-06-10"
 
 import os
@@ -17,6 +17,7 @@ import curses
 import subprocess
 import configparser
 import threading
+import random
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -588,41 +589,240 @@ class MPV:
 # Login screen
 # ─────────────────────────────────────────────
 
+# Login screen ASCII art
+_POCKET_ART = [
+    r"██████╗  ██████╗  ██████╗██╗  ██╗███████╗████████╗",
+    r"██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝",
+    r"██████╔╝██║   ██║██║     █████╔╝ █████╗     ██║   ",
+    r"██╔═══╝ ██║   ██║██║     ██╔═██╗ ██╔══╝     ██║   ",
+    r"██║     ╚██████╔╝╚██████╗██║  ██╗███████╗   ██║   ",
+]
+_CLI_ART = [
+    r" ██████╗██╗     ██╗",
+    r"██╔════╝██║     ██║",
+    r"██║     ██║     ██║",
+    r"██║     ██║     ██║",
+    r"╚██████╗███████╗██║",
+]
+_TAGLINES = [
+    "the unofficial pocket casts terminal client.",
+    "your pocket casts. your terminal.",
+    "no browser. no electron. just audio.",
+    "pocket casts... a bit different.",
+    "pocket casts, without leaving the terminal.",
+]
+
+
 def curses_login(stdscr):
+    """Full-screen login UI with ASCII art header and blinking cursor.
+
+    Flow:
+      1. Draw POCKET (orange) + CLI (green) ASCII art, tagline, separator.
+      2. Blink '█' cursor at the end of the last CLI art line until any key
+         is pressed — that keypress is discarded (it is not part of the email).
+      3. Show Email / Password prompts and collect credentials.
+      4. POST to Pocket Casts login endpoint and save the token.
+
+    Returns:
+        (token, None)  on success
+        (None, error)  on failure
+    """
+    # ── Color pairs ──────────────────────────────────────────────────────────
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_RED,   -1)   # POCKET — warm red/orange
+    curses.init_pair(2, curses.COLOR_GREEN, -1)   # CLI — matrix green
+    curses.init_pair(3, curses.COLOR_WHITE, -1)   # tagline / separator
+
+    curses.curs_set(0)    # hide text cursor during art phase
+    curses.noecho()
+    stdscr.clear()
+
+    h, w     = stdscr.getmaxyx()
+    tagline  = random.choice(_TAGLINES)
+
+    # ── Layout math ──────────────────────────────────────────────────────────
+    # Total art height: POCKET rows + CLI rows
+    art_rows  = len(_POCKET_ART) + len(_CLI_ART)
+    # Full block: art + blank + tagline + blank + separator + blank + email + blank + password
+    block_h   = art_rows + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+    top       = max(1, (h - block_h) // 2)
+
+    # Horizontal anchor: center the wider POCKET block
+    art_w     = len(_POCKET_ART[0])
+    cx        = max(0, (w - art_w) // 2)
+
+    # CLI and cursor share the same left anchor as POCKET
+    cli_cx    = cx
+
+    # Row positions (computed once, reused everywhere)
+    pocket_rows = [top + i for i in range(len(_POCKET_ART))]
+    cli_start   = top + len(_POCKET_ART)
+    cli_rows    = [cli_start + i for i in range(len(_CLI_ART))]
+    cursor_row  = cli_rows[-1]                    # last CLI art row
+    cursor_col  = cli_cx + len(_CLI_ART[0])       # immediately right of last char
+    tagline_row = cli_rows[-1] + 2
+    sep_row     = tagline_row + 2
+    email_row   = sep_row + 2
+    pass_row    = email_row + 2
+
+    # ── Static draw ──────────────────────────────────────────────────────────
+    def draw_static():
+        stdscr.clear()
+
+        # POCKET in orange/red bold
+        for i, line in enumerate(_POCKET_ART):
+            try:
+                stdscr.addstr(pocket_rows[i], cx, line,
+                              curses.color_pair(1) | curses.A_BOLD)
+            except Exception:
+                pass
+
+        # CLI in matrix green bold, left-aligned with POCKET
+        for i, line in enumerate(_CLI_ART):
+            try:
+                stdscr.addstr(cli_rows[i], cli_cx, line,
+                              curses.color_pair(2) | curses.A_BOLD)
+            except Exception:
+                pass
+
+        # Tagline — centered horizontally
+        try:
+            tl_col = max(0, (w - len(tagline)) // 2)
+            stdscr.addstr(tagline_row, tl_col, tagline, curses.color_pair(3))
+        except Exception:
+            pass
+
+        # Separator — same width and left edge as POCKET
+        try:
+            stdscr.addstr(sep_row, cx, "─" * min(art_w, w - cx),
+                          curses.color_pair(3))
+        except Exception:
+            pass
+
+        # "press any key" hint below separator
+        hint = "press any key to continue"
+        try:
+            stdscr.addstr(sep_row + 1, cx, hint, curses.color_pair(3))
+        except Exception:
+            pass
+
+        stdscr.refresh()
+
+    draw_static()
+
+    # ── Blinking cursor ───────────────────────────────────────────────────────
+    # Runs in a daemon thread; stopped the moment the user presses any key.
+    stop_blink = threading.Event()
+
+    def _blink():
+        visible = True
+        while not stop_blink.is_set():
+            char = "█" if visible else " "
+            try:
+                stdscr.addstr(cursor_row, cursor_col, char,
+                              curses.color_pair(2) | curses.A_BOLD)
+                stdscr.refresh()
+            except Exception:
+                pass
+            visible = not visible
+            stop_blink.wait(0.5)
+
+    blink_thread = threading.Thread(target=_blink, daemon=True)
+    blink_thread.start()
+
+    # Block until any key to stop the blink animation.
+    # We save the key in case it is a printable character (first letter of email).
+    stdscr.nodelay(False)
+    first_key = stdscr.getch()
+
+    # Stop blink, erase cursor and hint
+    stop_blink.set()
+    blink_thread.join()
+    try:
+        stdscr.addstr(cursor_row, cursor_col, " ")
+    except Exception:
+        pass
+    try:
+        stdscr.addstr(sep_row + 1, cx, " " * 30)
+    except Exception:
+        pass
+
+    # ── Credential input ──────────────────────────────────────────────────────
     curses.curs_set(1)
     curses.echo()
-    stdscr.clear()
-    h, w = stdscr.getmaxyx()
-    cx = (w - 30) // 2
-
-    stdscr.addstr(h // 2 - 3, cx, "  pocketcli - Login  ", curses.A_REVERSE)
-    stdscr.addstr(h // 2 - 1, cx, "Email: ")
-    stdscr.refresh()
-    email = stdscr.getstr(h // 2 - 1, cx + 7, 50).decode()
-
-    stdscr.addstr(h // 2 + 1, cx, "Password: ")
-    stdscr.refresh()
-    curses.noecho()
-    password = stdscr.getstr(h // 2 + 1, cx + 10, 50).decode()
-
-    stdscr.addstr(h // 2 + 3, cx, "Authenticating...")
-    stdscr.refresh()
 
     try:
-        r = httpx.post(
-            f"{BASE_URL}/user/login",
-            json={"email": email, "password": password, "scope": "webplayer"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data  = r.json()
-        token = data.get("token")
-        if not token:
-            return None, "Login failed"
-        save_config(email, token, data.get("uuid", ""))
-        return token, None
-    except Exception as e:
-        return None, str(e)
+        stdscr.addstr(email_row, cx, "Email    : ", curses.color_pair(1))
+    except Exception:
+        pass
+    stdscr.refresh()
+
+    # If the first key was a printable char, display it and prepend to input
+    prefix = ""
+    if 32 <= first_key <= 126:
+        prefix = chr(first_key)
+        try:
+            stdscr.addstr(email_row, cx + 11, prefix)
+        except Exception:
+            pass
+        stdscr.refresh()
+
+    rest  = stdscr.getstr(email_row, cx + 11 + len(prefix), 60 - len(prefix)).decode().strip()
+    email = (prefix + rest).strip()
+
+    curses.noecho()   # hide password characters
+
+    try:
+        stdscr.addstr(pass_row, cx, "Password : ", curses.color_pair(1))
+    except Exception:
+        pass
+    stdscr.refresh()
+    password = stdscr.getstr(pass_row, cx + 11, 60).decode().strip()
+
+    # ── Authenticate — retry loop ─────────────────────────────────────────────
+    while True:
+        curses.curs_set(0)
+        try:
+            stdscr.addstr(pass_row + 2, cx, "Authenticating...          ", curses.color_pair(2))
+        except Exception:
+            pass
+        stdscr.refresh()
+
+        try:
+            r = httpx.post(
+                f"{BASE_URL}/user/login",
+                json={"email": email, "password": password, "scope": "webplayer"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data  = r.json()
+            token = data.get("token")
+            if not token:
+                raise ValueError("No token in response")
+            save_config(email, token, data.get("uuid", ""))
+            return token, None
+
+        except Exception as e:
+            # Show error and let user retry password
+            err_msg = "Invalid credentials. Try again." if "401" in str(e) else f"Error: {e}"
+            try:
+                stdscr.addstr(pass_row + 2, cx, f"  {err_msg[:art_w - 2]}  ",
+                              curses.color_pair(1) | curses.A_BOLD)
+            except Exception:
+                pass
+            stdscr.refresh()
+
+            # Clear password field and retry
+            try:
+                stdscr.addstr(pass_row, cx, "Password : " + " " * 60,
+                              curses.color_pair(1))
+            except Exception:
+                pass
+            stdscr.refresh()
+            curses.curs_set(1)
+            curses.noecho()
+            password = stdscr.getstr(pass_row, cx + 11, 60).decode().strip()
 
 
 # ─────────────────────────────────────────────
@@ -2533,7 +2733,6 @@ class PocketTUI:
                 mod = x.get("modifiedAt") or x.get("playedUpToModified", "0")
                 try:
                     if mod and "T" in str(mod):
-                        from datetime import datetime
                         return datetime.fromisoformat(mod.replace("Z", "+00:00")).timestamp()
                     if mod and mod != "0":
                         return int(mod) / 1000
@@ -2599,7 +2798,10 @@ def main(stdscr):
     if not token:
         token, err = curses_login(stdscr)
         if not token:
-            curses.endwin()
+            try:
+                curses.endwin()
+            except Exception:
+                pass
             print(f"Login error: {err}")
             sys.exit(1)
     api = API(token)
