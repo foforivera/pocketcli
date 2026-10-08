@@ -2,69 +2,34 @@
 
 ## [1.11.1] - 2026-10-08
 
-### Fixed
-- Uploaded files (audiobooks) listed in Up Next could not be played from the Up Next tab ("Could not get episode URL"): they were treated as podcast episodes. They now play through the Files API, resume where they were and show their progress
-
-## [1.11.0] - 2026-10-08
-
 ### Added
-- **Up Next**: playing an episode makes it the current item of your Pocket Casts Up Next, which is what other devices show as now playing
-- **Up Next tab** (`7`): the queue in order, current item first; `Enter` plays, `x` removes
-- `a` adds the selected episode to the end of Up Next and `A` right after the current one (episode lists, In Progress, New, Starred)
-- `r` reloads the current list
-- An episode that plays to the end is removed from Up Next
-- The tab bar shortens inactive tabs to their number when the terminal is too narrow
-
-### Notes
-- Files (audiobooks) are not added to Up Next yet
-- Nothing is sent to Up Next unless the episode has a real Pocket Casts id: the server accepts an empty id and the queue then fails to load
-
-## [1.10.2] - 2026-10-08
-
-### Fixed
-- Episode progress never reached Pocket Casts: the position was posted to `/sync/update_episode_position`, which does not exist (HTTP 404, hidden until 1.10.0 started showing sync errors). Position and "played" now go to `/sync/update_episode` with the episode in the `uuid` field
-
-## [1.10.1] - 2026-10-08
-
-### Fixed
-- Themes showed dark blue and dark green text in Konsole. Konsole reports that palette colors can be redefined but ignores the request, so the stock colors of slots 16-24 were shown. Konsole now gets the nearest color of the fixed 256-color palette
-- Terminals with 256 colors but no palette redefinition now use the nearest 256-color match instead of the 8 basic ANSI colors
-
-### Added
-- `POCKETCLI_TRUECOLOR=1` or `=0` forces exact palette colors on or off
-
-## [1.10.0] - 2026-10-08
-
-### Added
-- **Key registry**: one table now drives key handling, the `?` keymap, the footer and player hints and the README tables, so they cannot drift apart
-- `pocketcli --keys`, `--version`, `--logout` and `--help`
-- `Home` / `End` and `g` / `G` jump to the top or bottom of any list
+- **Up Next**: what you play becomes the current item of your Pocket Casts Up Next, so other devices follow along
+- **Up Next tab** (`7`): the queue in order; `Enter` plays (episodes and uploaded files), `x` removes
+- `a` / `A` add the selected episode to the end of Up Next or right after the current one
+- **Key registry**: one table drives key handling, the `?` keymap, the on-screen hints and the README tables
+- `Home` / `End` and `g` / `G` jump to the top or bottom of a list; `r` reloads it
 - Theme, speed and skip silence are remembered between runs
-- The keymap and theme overlays scroll, so they fit small terminals
-- Sync failures are shown in the status bar (once per episode) instead of being dropped silently
+- `pocketcli --keys`, `--version`, `--logout` and `--help`
 
 ### Changed
-- Skip silence (`S`) applies immediately to what is playing
-- Starting playback no longer freezes the UI while the stream URL is fetched; startup no longer waits for the "last played" lookup
+- Skip silence (`S`) applies right away to what is playing
+- Starting playback and startup no longer freeze the UI
 - Resuming backs up 5 seconds; a position inside the first 15 seconds starts over
-- `]` / `[` and `S` also work while nothing is playing (they set the value for the next play)
-- The auth token file is written atomically with mode 0600; older files are tightened on start
-- mpv uses one IPC socket per instance under `$XDG_RUNTIME_DIR` instead of a fixed path in `/tmp`
+- Sync failures are shown in the status bar instead of being dropped silently
+- The keymap and theme overlays scroll, and the tab bar shortens itself, to fit small terminals
+- The auth token file is written with mode 0600
+- One mpv socket per instance under `$XDG_RUNTIME_DIR`, so two instances can run at once
 
 ### Fixed
-- Episodes opened from the Podcasts tab or from search synced under the RSS `guid`, which Pocket Casts does not know. They now use the real Pocket Casts episode UUID
-- A stream that failed to start, or mpv dying mid-episode, marked the episode as played. Only playing to the end does now; otherwise the position is kept
-- An mpv event arriving before a reply made the position read as 0:00, and pausing then synced position 0. Replies are matched by request id and the last good position is kept
-- `q` quit the app while the keymap or theme overlay was open
-- `q` could not be typed in the search boxes
+- Episode progress did not reach Pocket Casts: it was posted to an endpoint that answers 404, and under the RSS `guid` instead of the Pocket Casts episode UUID
+- A stream that failed to start, or mpv dying mid-episode, marked the episode as played
+- The position could read as 0:00 and then be synced as 0 when pausing
+- Themes showed dark blue and dark green text in Konsole
+- `q` quit the app with the keymap or theme overlay open, and could not be typed in the search boxes
 - `Esc` took a full second to register
 - The sleep timer resumed playback if it fired while already paused
-- `d` on an empty list opened an invisible overlay that swallowed keys
-- Two pocketcli instances fought over the same mpv socket
 - Quitting with Ctrl-C skipped the final position sync
-- An expired login now says so instead of a raw HTTP error
-- A feed URL starting with `-` could be read by mpv as an option
-- Looking up a feed by title could load another show's episodes; the result is now checked against the Pocket Casts episode list
+- An expired login now says so instead of showing a raw HTTP error
 
 ## [1.9.1] - 2026-06-10
 
