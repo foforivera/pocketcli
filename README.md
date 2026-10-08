@@ -17,6 +17,7 @@ Built with Python and `curses`. No Electron. No browser. Just a terminal.
 ## Features
 
 - **Full TUI** — browse podcasts, episodes, queue, starred, and uploaded files
+- **Up Next**: what you play becomes the current item of your Pocket Casts Up Next, so the phone app follows along; a tab shows the queue, `a` / `A` add episodes, `x` removes
 - **Tab navigation** — `Tab` moves focus between content, tab bar, and sub-menus; arrows navigate within each level
 - **Discover tab** — browse Trending, Popular, and Featured lists; search and subscribe via iTunes
 - **Subscribe / Unsubscribe** — manage your library without opening the app
@@ -112,7 +113,7 @@ Press `?` inside the app for this list. The tables below are generated with `poc
 | `Tab` | Focus: content, tab bar, sub-menu |
 | `Shift+Tab` | Focus: reverse direction |
 | `← →` | Move between tabs or sub-menu items when focused |
-| `1-6` | Jump directly to tab |
+| `1-7` | Jump directly to tab |
 | `↑↓ / j k` | Navigate list |
 | `PgUp PgDn` | Jump page |
 | `Home End / g G` | Jump to top / bottom |
@@ -123,6 +124,9 @@ Press `?` inside the app for this list. The tables below are generated with `poc
 | `d` | Show episode description and chapters |
 | `u` | Unsubscribe from selected podcast (Podcasts tab) |
 | `x` | Delete selected file from cloud (Files tab) |
+| `a / A` | Add to Up Next: at the end / right after the current one |
+| `x` | Remove from Up Next (Up Next tab) |
+| `r` | Reload the current list |
 
 ### Player
 

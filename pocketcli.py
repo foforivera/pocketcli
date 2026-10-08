@@ -4,7 +4,7 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.10.2"
+VERSION = "1.11.1"
 BUILD   = "2026-10-08"
 
 import os
@@ -41,6 +41,10 @@ ITUNES_URL  = "https://itunes.apple.com/search"
 LISTS_URL   = "https://lists.pocketcasts.com"
 USER_AGENT  = f"pocketcli/{VERSION}"
 
+# Pocket Casts files things under this fixed "podcast" id when an uploaded
+# file (audiobook) sits in Up Next
+FILE_PODCAST_UUID = "da7aba5e-f11e-f11e-f11e-da7aba5ef11e"
+
 # Resume rules. A position inside the first RESUME_MIN seconds is not worth
 # resuming, a resumed episode backs up RESUME_REWIND seconds for context, and
 # an episode stopped inside its last PLAYED_TAIL seconds counts as played.
@@ -64,6 +68,7 @@ TABS = [
     ("4", "Starred",     "queue",     "starred"),
     ("5", "Files",       "files",     None),
     ("6", "Discover",    "discover",  None),
+    ("7", "Up Next",     "queue",     "up_next"),
 ]
 
 # Discover sub-modes
@@ -109,7 +114,8 @@ class KeyRow:
     section      heading it is listed under
     label, desc  how the key and its action read in the keymap overlay
     binds        list of _bind(); empty for keys handled by the input loop itself
-    views        views where the key is active (None = everywhere)
+    views        views where the key is active (None = everywhere); the Up Next
+                 tab counts as its own view, "upnext" (see PocketTUI._ctx)
     needs        "mpv" when the key only works while something is playing
     badge        short text for the footer hint row (None = not shown there)
     badge_views  views whose footer shows the badge (default: same as views)
@@ -154,7 +160,7 @@ KEYMAP = [
     KeyRow(SEC_NAV, "Enter",     "Open, play or subscribe to the selected item",
            binds=[_bind(_ENTER, "select")]),
     KeyRow(SEC_NAV, "Enter", "", views=("podcasts",),                  badge="open",      help=False),
-    KeyRow(SEC_NAV, "Enter", "", views=("episodes", "queue", "files"), badge="play",      help=False),
+    KeyRow(SEC_NAV, "Enter", "", views=("episodes", "queue", "upnext", "files"), badge="play", help=False),
     KeyRow(SEC_NAV, "Enter", "", views=("discover",),                  badge="subscribe", help=False),
     KeyRow(SEC_NAV, "Esc",       "Back / close overlay / drop focus"),
     KeyRow(SEC_NAV, "Esc",   "", views=("episodes",),                  badge="back",      help=False),
@@ -168,6 +174,13 @@ KEYMAP = [
            binds=[_bind(["u"], "unsubscribe")], views=("podcasts",), badge="unsub"),
     KeyRow(SEC_NAV, "x",         "Delete selected file from cloud (Files tab)",
            binds=[_bind(["x"], "delete_file")], views=("files",), badge="delete"),
+    KeyRow(SEC_NAV, "a / A",     "Add to Up Next: at the end / right after the current one",
+           binds=[_bind(["a"], "queue_add", "last"), _bind(["A"], "queue_add", "next")],
+           views=("episodes", "queue"), badge="up next", blabel="a/A"),
+    KeyRow(SEC_NAV, "x",         "Remove from Up Next (Up Next tab)",
+           binds=[_bind(["x"], "queue_remove")], views=("upnext",), badge="remove"),
+    KeyRow(SEC_NAV, "r",         "Reload the current list",
+           binds=[_bind(["r"], "reload")], views=("podcasts", "queue", "upnext", "files")),
 
     # ── Player ──
     KeyRow(SEC_PLAYER, "Space / p", "Play / Pause",
@@ -508,6 +521,9 @@ class AuthExpired(Exception):
         return "Session expired. Run 'pocketcli --logout' and log in again."
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
 def _norm_title(text):
     return re.sub(r"\s+", " ", (text or "")).strip().casefold()
 
@@ -696,6 +712,8 @@ class API:
             ep["guid"] = ep.get("uuid", "")
             if match and match.get("uuid"):
                 ep["uuid"] = match["uuid"]
+                if match.get("published"):
+                    ep["published"] = match["published"]   # full timestamp, for Up Next
                 if not ep.get("duration"):
                     ep["duration"] = int(match.get("duration") or 0)
                 ep.pop("unresolved", None)
@@ -739,6 +757,7 @@ class API:
                     "url":           c.get("url", ""),
                     "duration":      int(c.get("duration") or 0),
                     "publishedAt":   (c.get("published") or "")[:10],
+                    "published":     c.get("published") or "",
                     "description":   "",
                     "playedUpTo":    0,
                     "playingStatus": 0,
@@ -801,6 +820,64 @@ class API:
 
     def starred(self):
         return self._post("/user/starred").get("episodes", [])
+
+    # ── Up Next ──
+
+    @staticmethod
+    def up_next_episode(pod_uuid, ep, url=None):
+        """The episode object the Up Next calls expect, or None.
+
+        The server stores whatever it is sent: an episode with an empty uuid
+        is accepted and then breaks reading the queue. So nothing incomplete
+        is ever sent, and both ids must look like Pocket Casts UUIDs."""
+        if ep.get("unresolved"):
+            return None
+        published = ep.get("published") or ep.get("publishedAt") or ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", published):
+            published += "T00:00:00Z"
+        payload = {
+            "uuid":      ep.get("uuid"),
+            "title":     ep.get("title"),
+            "url":       ep.get("url") or ep.get("streamUrl") or url,
+            "podcast":   pod_uuid,
+            "published": published,
+        }
+        if not all(isinstance(v, str) and v.strip() for v in payload.values()):
+            return None
+        if not (_UUID_RE.fullmatch(payload["uuid"]) and _UUID_RE.fullmatch(payload["podcast"])):
+            return None
+        return payload
+
+    def up_next_list(self):
+        """The Up Next queue in order, first item = what is current."""
+        try:
+            data = self._post("/up_next/list",
+                              {"version": 2, "model": "webplayer", "showPlayStatus": True})
+        except httpx.HTTPStatusError:
+            # The play-status variant fails if the queue holds a broken entry
+            data = self._post("/up_next/list", {"version": 2})
+        eps = data.get("episodes") or []
+        return [e for e in eps if isinstance(e, dict) and e.get("uuid")]
+
+    def up_next_add(self, where, payload):
+        """where: "now" (make current), "next" or "last". Returns None or an error."""
+        if where not in ("now", "next", "last") or not payload:
+            return "nothing to add"
+        try:
+            self._post(f"/up_next/play_{where}", {"version": 2, "episode": payload})
+        except Exception as e:
+            return self._err(e)
+        return None
+
+    def up_next_remove(self, uuids):
+        uuids = [u for u in uuids if isinstance(u, str) and _UUID_RE.fullmatch(u)]
+        if not uuids:
+            return "nothing to remove"
+        try:
+            self._post("/up_next/remove", {"version": 2, "uuids": uuids})
+        except Exception as e:
+            return self._err(e)
+        return None
 
     # ── Curated lists ──
 
@@ -1436,7 +1513,7 @@ class PocketTUI:
     # View identifiers
     VIEW_PODCASTS = "podcasts"
     VIEW_EPISODES = "episodes"
-    VIEW_QUEUE    = "queue"      # in_progress | new | starred
+    VIEW_QUEUE    = "queue"      # in_progress | new | starred | up_next
     VIEW_FILES    = "files"
     VIEW_DISCOVER = "discover"
 
@@ -1461,7 +1538,7 @@ class PocketTUI:
         self.episodes   = []
         self.queue_items = []
         self.files_items = []
-        self.queue_mode  = "in_progress"   # in_progress | new | starred
+        self.queue_mode  = "in_progress"   # in_progress | new | starred | up_next
         self.current_pod = None
 
         # List cursors and scroll offsets per view
@@ -1631,18 +1708,45 @@ class PocketTUI:
                     self.status(f"Error loading episodes: {e}", error=True)
         threading.Thread(target=_load, daemon=True).start()
 
-    def load_queue(self):
+    def load_queue(self, keep_cursor=False):
         self.status("Loading...")
+        mode = self.queue_mode
         def _load():
             try:
-                if self.queue_mode == "in_progress":
+                if mode == "in_progress":
                     items = self.api.in_progress()
-                elif self.queue_mode == "new":
+                elif mode == "new":
                     items = self.api.new_releases()
+                elif mode == "up_next":
+                    items  = self.api.up_next_list()
+                    titles = {p.get("uuid"): p.get("title", "") for p in self.podcasts}
+                    # Up Next mixes episodes and uploaded files. A file must be
+                    # played through the Files API, so tell them apart here.
+                    try:
+                        files = {f.get("uuid"): f for f in self.api.files()}
+                    except Exception:
+                        files = {f.get("uuid"): f for f in self.files_items}
+                    for ep in items:
+                        ep.setdefault("podcastUuid", ep.get("podcast", ""))
+                        if ep.get("uuid") in files or ep.get("podcast") == FILE_PODCAST_UUID:
+                            ep["file"]         = files.get(ep.get("uuid")) or {
+                                "uuid": ep.get("uuid"), "title": ep.get("title", "")}
+                            ep["podcastTitle"] = "Files"
+                            for k in ("duration", "playedUpTo", "playingStatus"):
+                                if k in ep["file"]:
+                                    ep.setdefault(k, ep["file"][k])
+                        else:
+                            ep.setdefault("podcastTitle", titles.get(ep.get("podcast"), ""))
                 else:
                     items = self.api.starred()
+                if mode != self.queue_mode:
+                    return  # the user switched tabs while this was loading
                 self.queue_items = items
-                self.q_cursor = self.q_offset = 0
+                if keep_cursor:
+                    self.q_cursor = min(self.q_cursor, max(0, len(items) - 1))
+                    self.q_offset = min(self.q_offset, self.q_cursor)
+                else:
+                    self.q_cursor = self.q_offset = 0
                 self.status("")
             except Exception as e:
                 self.status(f"Error: {e}", error=True)
@@ -1779,8 +1883,32 @@ class PocketTUI:
                 self.status("Playing. Pocket Casts does not list this episode: progress will not sync")
             else:
                 self.status(f"Playing: {title[:50]}")
+            self._announce_playing(pod, ep, url, gen)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _announce_playing(self, pod, ep, url, gen):
+        """Make the episode the current item of Up Next, which is what other
+        devices show as "now playing". Runs in the playback worker thread."""
+        if pod.get("uuid") == "__files__":
+            return
+        payload = self.api.up_next_episode(pod.get("uuid"), ep, url)
+        if not payload:
+            if not ep.get("unresolved"):
+                # Say why, so a list that lacks a field does not fail silently
+                have = {"uuid": ep.get("uuid"), "podcast": pod.get("uuid"), "title": ep.get("title"),
+                        "url": ep.get("url") or ep.get("streamUrl") or url,
+                        "published": ep.get("published") or ep.get("publishedAt")}
+                missing = ", ".join(k for k, v in have.items() if not v) or "a valid id"
+                self.status(f"Playing. Not sent to Up Next: no {missing}")
+            return
+        err = self.api.up_next_add("now", payload)
+        if gen != self._play_gen:
+            return
+        if err:
+            self.status(f"Up Next failed: {err}", error=True)
+        elif self._ctx() == "upnext":
+            self.load_queue(keep_cursor=True)
 
     def play(self, podcast_dict, episode_dict):
         def _url():
@@ -1846,6 +1974,9 @@ class PocketTUI:
             ep["playingStatus"] = 3
             ep["playedUpTo"]    = int(dur or pos)
             self._push_sync(dur or pos, status=3)
+            if pod.get("uuid") != "__files__" and not ep.get("unresolved"):
+                uuid = ep.get("uuid", "")
+                threading.Thread(target=lambda: self.api.up_next_remove([uuid]), daemon=True).start()
             self.status(f"Finished: {title}")
             self.playing_ep  = None
             self.playing_pod = None
@@ -2095,11 +2226,13 @@ class PocketTUI:
     def _draw_tabs(self, w):
         """Tab bar: active=green, focused(FOCUS_TABBAR)=reverse, others=dim."""
         active_idx = self._current_tab_idx()
+        full_w  = 1 + sum(len(f"[{k}] {lbl}") + 2 for k, lbl, _, _ in TABS)
+        compact = full_w > w   # narrow terminal: only the active tab keeps its name
         x = 1
         for i, (key, label, _, _) in enumerate(TABS):
             is_active  = i == active_idx
             is_focused = (self.focus_level == self.FOCUS_TABBAR and i == self.tab_cursor)
-            tag = f"[{key}] {label}"
+            tag = f"[{key}] {label}" if (not compact or is_active or is_focused) else f"[{key}]"
 
             if is_focused:
                 self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
@@ -2215,10 +2348,9 @@ class PocketTUI:
 
         elif self.view == self.VIEW_QUEUE:
             self._draw_list(top, height, w, self.queue_items, self.q_cursor, self.q_offset,
-                            lambda _, ep: (
-                                trunc(ep.get("title", ""), w - 30),
-                                f"{trunc(ep.get('podcastTitle', ''), 14)}  "
-                                f"{fmt_dur(ep.get('playedUpTo', 0))}/{fmt_dur(ep.get('duration', 0))}",
+                            lambda idx, ep: (
+                                self._queue_left(idx, ep, w),
+                                self._queue_right(ep),
                             ))
 
         elif self.view == self.VIEW_FILES:
@@ -2295,6 +2427,19 @@ class PocketTUI:
                     self.scr.addstr(top + y, w - 1, char, curses.color_pair(3))
                 except Exception:
                     pass
+
+    def _queue_left(self, idx, ep, w):
+        title = trunc(ep.get("title", ""), w - 32)
+        if self.queue_mode == "up_next":
+            return ("▶ " if idx == 0 else f"{idx}. ") + title
+        return title
+
+    def _queue_right(self, ep):
+        pod = ep.get("podcastTitle", "")
+        if ep.get("duration"):
+            return (f"{trunc(pod, 14)}  "
+                    f"{fmt_dur(ep.get('playedUpTo', 0))}/{fmt_dur(ep.get('duration', 0))}")
+        return trunc(pod, 26)
 
     def _ep_indicator(self, ep):
         stat = ep.get("playingStatus", 0) or 0
@@ -2567,7 +2712,7 @@ class PocketTUI:
 
         self._draw_badges(y, w, [
             (row.blabel, row.badge) for row in KEYMAP
-            if row.badge and (row.badge_views is None or self.view in row.badge_views)
+            if row.badge and (row.badge_views is None or self._ctx() in row.badge_views)
         ])
 
     def _draw_badges(self, y, w, badges):
@@ -3006,10 +3151,18 @@ class PocketTUI:
         self._dispatch(key)
         return True
 
+    def _ctx(self):
+        """The view name the key registry sees. The Up Next tab shares the
+        queue view but has its own keys, so it reports as "upnext"."""
+        if self.view == self.VIEW_QUEUE and self.queue_mode == "up_next":
+            return "upnext"
+        return self.view
+
     def _dispatch(self, key):
         """Run the registry action bound to key in the current view, if any."""
+        ctx = self._ctx()
         for row in KEYMAP:
-            if row.views is not None and self.view not in row.views:
+            if row.views is not None and ctx not in row.views:
                 continue
             if row.needs == "mpv" and not self.mpv.is_running():
                 continue
@@ -3070,6 +3223,9 @@ class PocketTUI:
         elif self.view == self.VIEW_EPISODES:
             self.play(self.current_pod, item)
         elif self.view == self.VIEW_QUEUE:
+            if item.get("file"):
+                self.play_file(item["file"])   # an uploaded file sitting in Up Next
+                return
             pod_uuid = item.get("podcastUuid") or item.get("podcast_uuid") or item.get("podcast")
             self.play({"uuid": pod_uuid, "title": item.get("podcastTitle", "")}, item)
         elif self.view == self.VIEW_FILES:
@@ -3107,6 +3263,51 @@ class PocketTUI:
         if f is not None:
             self.del_file_target = f
             self.del_file_step   = 1
+
+    def _item_podcast_uuid(self, item):
+        if self.view == self.VIEW_EPISODES:
+            return (self.current_pod or {}).get("uuid", "")
+        return item.get("podcastUuid") or item.get("podcast_uuid") or item.get("podcast") or ""
+
+    def _act_queue_add(self, where):
+        item = self._selected()
+        if item is None:
+            return
+        payload = self.api.up_next_episode(self._item_podcast_uuid(item), item)
+        if not payload:
+            self.status("Cannot add to Up Next: Pocket Casts does not list this episode", error=True)
+            return
+        title = item.get("title", "")[:40]
+        def _add():
+            err = self.api.up_next_add(where, payload)
+            if err:
+                self.status(f"Up Next failed: {err}", error=True)
+            else:
+                self.status(f"Up Next ({'next' if where == 'next' else 'last'}): {title}")
+        threading.Thread(target=_add, daemon=True).start()
+
+    def _act_queue_remove(self):
+        item = self._selected()
+        if item is None:
+            return
+        uuid, title = item.get("uuid", ""), item.get("title", "")[:40]
+        def _remove():
+            err = self.api.up_next_remove([uuid])
+            if err:
+                self.status(f"Up Next failed: {err}", error=True)
+                return
+            self.queue_items = [e for e in self.queue_items if e.get("uuid") != uuid]
+            self.q_cursor    = min(self.q_cursor, max(0, len(self.queue_items) - 1))
+            self.status(f"Removed from Up Next: {title}")
+        threading.Thread(target=_remove, daemon=True).start()
+
+    def _act_reload(self):
+        if self.view == self.VIEW_PODCASTS:
+            self.load_podcasts()
+        elif self.view == self.VIEW_QUEUE:
+            self.load_queue(keep_cursor=True)
+        elif self.view == self.VIEW_FILES:
+            self.load_files()
 
     # ── Registry actions: player ──
 

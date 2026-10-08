@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.11.1] - 2026-10-08
+
+### Fixed
+- Uploaded files (audiobooks) listed in Up Next could not be played from the Up Next tab ("Could not get episode URL"): they were treated as podcast episodes. They now play through the Files API, resume where they were and show their progress
+
+## [1.11.0] - 2026-10-08
+
+### Added
+- **Up Next**: playing an episode makes it the current item of your Pocket Casts Up Next, which is what other devices show as now playing
+- **Up Next tab** (`7`): the queue in order, current item first; `Enter` plays, `x` removes
+- `a` adds the selected episode to the end of Up Next and `A` right after the current one (episode lists, In Progress, New, Starred)
+- `r` reloads the current list
+- An episode that plays to the end is removed from Up Next
+- The tab bar shortens inactive tabs to their number when the terminal is too narrow
+
+### Notes
+- Files (audiobooks) are not added to Up Next yet
+- Nothing is sent to Up Next unless the episode has a real Pocket Casts id: the server accepts an empty id and the queue then fails to load
+
 ## [1.10.2] - 2026-10-08
 
 ### Fixed
