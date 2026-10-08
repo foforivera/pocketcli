@@ -22,18 +22,19 @@ Built with Python and `curses`. No Electron. No browser. Just a terminal.
 - **Subscribe / Unsubscribe** — manage your library without opening the app
 - **Delete from cloud** — remove uploaded files from Pocket Casts cloud storage directly from the TUI
 - **Sleep timer** — set a 5, 15, 30, or 60 minute timer; pauses playback and syncs position when it fires
-- **Bidirectional sync** — playback position synced to Pocket Casts every 30s and on exit
-- **Resume on launch** — opens with the last played episode ready to go, press space to continue
+- **Bidirectional sync** — playback position synced to Pocket Casts every 30s, on pause and on exit; a failed sync is shown instead of being dropped silently
+- **Resume on launch** — opens with the last played episode ready to go, press space to continue; resuming backs up 5 seconds for context
 - **Episode status** — ● played, ◐ in progress, ○ not played
 - **Chapter support** — displays current chapter name, jump with `n` / `N`
-- **Skip silence** — 3 levels (normal / medium / aggressive)
+- **Skip silence** — 3 levels (normal / medium / aggressive), applied right away while playing
 - **Speed control** — 0.5x to 2.0x without pitch change
+- **Remembers your settings**: theme, speed and skip silence are kept between runs
 - **Files support** — audiobooks and custom uploads with progress tracking
 - **Episode descriptions** — press `d` to read the episode description with chapter breakdown
 - **Search** — press `/` to search episodes or discover new podcasts via iTunes
 - **20 built-in themes** — press `t` to switch; list items use the theme's colors throughout
 - **Truecolor support** — exact hex colors on compatible terminals, ANSI fallback otherwise
-- **Keymap overlay** — press `?` to see all keybindings
+- **Keymap overlay** — press `?` to see all keybindings (scrolls on small terminals)
 
 ---
 
@@ -88,43 +89,58 @@ chmod +x ~/.local/bin/pocketcli
 pocketcli
 ```
 
-You will be prompted for your Pocket Casts email and password. The auth token is saved to `~/.config/pocketcli/config.ini`. Your password is never stored.
+You will be prompted for your Pocket Casts email and password. The auth token is saved to `~/.config/pocketcli/config.ini`, readable only by you. Your password is never stored.
+
+Other options:
+
+```bash
+pocketcli --version   # print the version
+pocketcli --keys      # print the keymap as Markdown
+pocketcli --logout    # forget the saved login
+```
 
 ---
 
-## Navigation
+## Keys
+
+Press `?` inside the app for this list. The tables below are generated with `pocketcli --keys`, so they always match what the app does.
+
+### Navigation
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Move focus: content → tab bar → sub-menu |
-| `Shift+Tab` | Move focus backwards |
-| `←` `→` | Move between tabs or sub-menu items when focused |
-| `Enter` | Select focused tab or item |
-| `1` – `6` | Jump directly to tab |
-| `↑` `↓` / `j` `k` | Navigate list |
-| `PgUp` `PgDn` | Jump page |
+| `Tab` | Focus: content, tab bar, sub-menu |
+| `Shift+Tab` | Focus: reverse direction |
+| `← →` | Move between tabs or sub-menu items when focused |
+| `1-6` | Jump directly to tab |
+| `↑↓ / j k` | Navigate list |
+| `PgUp PgDn` | Jump page |
+| `Home End / g G` | Jump to top / bottom |
+| `Enter` | Open, play or subscribe to the selected item |
 | `Esc` | Back / close overlay / drop focus |
+| `Backspace / b` | Back to the podcast list (episode list) |
 | `/` | Search episodes or discover podcasts |
 | `d` | Show episode description and chapters |
-| `u` | Unsubscribe from selected podcast |
+| `u` | Unsubscribe from selected podcast (Podcasts tab) |
 | `x` | Delete selected file from cloud (Files tab) |
-| `t` | Theme selector |
-| `?` | Keymap overlay |
-| `q` | Quit (saves position) |
 
-## Player controls
+### Player
 
 | Key | Action |
 |-----|--------|
-| `Space` / `p` | Play / Pause |
-| `→` | +30 seconds |
-| `←` | -30 seconds |
-| `n` | Next chapter |
-| `N` | Previous chapter |
-| `]` | Speed up |
-| `[` | Speed down |
-| `S` | Cycle skip silence: off → normal → medium → aggressive |
+| `Space / p` | Play / Pause |
+| `← →` | Seek -30 / +30 seconds |
+| `n / N` | Next / previous chapter |
+| `] / [` | Speed up / down |
+| `S` | Skip silence: off / normal / medium / aggressive |
 | `z` | Sleep timer (5 / 15 / 30 / 60 min) |
+
+### Other
+
+| Key | Action |
+|-----|--------|
+| `t` | Theme selector |
+| `?` | Keymap overlay |
 | `q` | Quit (saves position) |
 
 ---
@@ -179,10 +195,11 @@ pocketcli-update
 ## Notes
 
 - Uses the unofficial Pocket Casts API (reverse-engineered). Works well in practice but not officially supported.
-- Episode listings are fetched from each podcast's RSS feed via the iTunes Search API.
+- Episode listings are fetched from each podcast's RSS feed via the iTunes Search API, then matched against the Pocket Casts episode list so progress syncs under the right episode. An episode Pocket Casts does not list yet still plays, with a note that its progress will not sync.
+- An episode is marked as played only when it plays to the end. If the stream fails, the position is kept and space resumes it.
 - Spotify-exclusive podcasts do not have public RSS feeds and will not load episodes.
 - Files (audiobooks) require a Pocket Casts Plus subscription.
-- To log out: `rm ~/.config/pocketcli/config.ini`
+- To log out: `pocketcli --logout`
 
 ---
 

@@ -4,8 +4,8 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.9.1"
-BUILD   = "2026-06-10"
+VERSION = "1.10.2"
+BUILD   = "2026-10-08"
 
 import os
 import re
@@ -14,6 +14,7 @@ import json
 import time
 import socket
 import curses
+import tempfile
 import subprocess
 import configparser
 import threading
@@ -34,10 +35,26 @@ import httpx
 CONFIG_DIR  = Path.home() / ".config" / "pocketcli"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
 THEMES_DIR  = CONFIG_DIR / "themes"
-SOCKET_PATH = "/tmp/pocketcli-mpv.sock"
 BASE_URL    = "https://api.pocketcasts.com"
+CACHE_URL   = "https://podcast-api.pocketcasts.com"
 ITUNES_URL  = "https://itunes.apple.com/search"
 LISTS_URL   = "https://lists.pocketcasts.com"
+USER_AGENT  = f"pocketcli/{VERSION}"
+
+# Resume rules. A position inside the first RESUME_MIN seconds is not worth
+# resuming, a resumed episode backs up RESUME_REWIND seconds for context, and
+# an episode stopped inside its last PLAYED_TAIL seconds counts as played.
+RESUME_MIN    = 15
+RESUME_REWIND = 5
+PLAYED_TAIL   = 60
+
+
+def _runtime_dir():
+    """Directory for the mpv IPC socket: private to the user when possible."""
+    d = os.environ.get("XDG_RUNTIME_DIR")
+    if d and os.path.isdir(d) and os.access(d, os.W_OK):
+        return d
+    return tempfile.gettempdir()
 
 # Tab definitions: (key, label, view, queue_mode)
 TABS = [
@@ -68,23 +85,251 @@ SILENCE_FILTERS = {
 }
 
 # ─────────────────────────────────────────────
+# Key registry
+# ─────────────────────────────────────────────
+#
+# One table describes every key: what it does, where it applies and how it is
+# shown. The dispatcher, the keymap overlay (?), the footer and player badges
+# and `pocketcli --keys` (the README tables) all read it, so they cannot drift
+# apart. To add a key: add a row here and an _act_<name> method on PocketTUI.
+
+SEC_NAV    = "Navigation"
+SEC_PLAYER = "Player"
+SEC_OTHER  = "Other"
+
+
+def _bind(keys, action, arg=None):
+    """keys: characters or curses key codes that trigger PocketTUI._act_<action>(arg)."""
+    return (tuple(ord(k) if isinstance(k, str) else k for k in keys), action, arg)
+
+
+class KeyRow:
+    """One line of the keymap.
+
+    section      heading it is listed under
+    label, desc  how the key and its action read in the keymap overlay
+    binds        list of _bind(); empty for keys handled by the input loop itself
+    views        views where the key is active (None = everywhere)
+    needs        "mpv" when the key only works while something is playing
+    badge        short text for the footer hint row (None = not shown there)
+    badge_views  views whose footer shows the badge (default: same as views)
+    pbadge       short text for the player hint row (None = not shown there)
+    blabel       short key label for badges (default: label)
+    help         False for rows that only exist to feed a badge
+    """
+    __slots__ = ("section", "label", "desc", "binds", "views", "needs",
+                 "badge", "badge_views", "pbadge", "blabel", "help")
+
+    def __init__(self, section, label, desc, binds=(), views=None, needs=None,
+                 badge=None, badge_views=None, pbadge=None, blabel=None, help=True):
+        self.section     = section
+        self.label       = label
+        self.desc        = desc
+        self.binds       = list(binds)
+        self.views       = views
+        self.needs       = needs
+        self.badge       = badge
+        self.badge_views = badge_views if badge_views is not None else views
+        self.pbadge      = pbadge
+        self.blabel      = blabel or label
+        self.help        = help
+
+
+_ENTER = (curses.KEY_ENTER, 10, 13)
+
+KEYMAP = [
+    # ── Navigation ──
+    KeyRow(SEC_NAV, "Tab",       "Focus: content, tab bar, sub-menu"),
+    KeyRow(SEC_NAV, "Shift+Tab", "Focus: reverse direction"),
+    KeyRow(SEC_NAV, "← →",       "Move between tabs or sub-menu items when focused"),
+    KeyRow(SEC_NAV, f"1-{len(TABS)}", "Jump directly to tab",
+           binds=[_bind([key], "tab", i) for i, (key, _, _, _) in enumerate(TABS)]),
+    KeyRow(SEC_NAV, "↑↓ / j k",  "Navigate list",
+           binds=[_bind([curses.KEY_DOWN, "j"], "move", 1), _bind([curses.KEY_UP, "k"], "move", -1)],
+           badge="navigate", blabel="↑↓"),
+    KeyRow(SEC_NAV, "PgUp PgDn", "Jump page",
+           binds=[_bind([curses.KEY_NPAGE], "page", 1), _bind([curses.KEY_PPAGE], "page", -1)]),
+    KeyRow(SEC_NAV, "Home End / g G", "Jump to top / bottom",
+           binds=[_bind([curses.KEY_HOME, "g"], "edge", -1), _bind([curses.KEY_END, "G"], "edge", 1)]),
+    KeyRow(SEC_NAV, "Enter",     "Open, play or subscribe to the selected item",
+           binds=[_bind(_ENTER, "select")]),
+    KeyRow(SEC_NAV, "Enter", "", views=("podcasts",),                  badge="open",      help=False),
+    KeyRow(SEC_NAV, "Enter", "", views=("episodes", "queue", "files"), badge="play",      help=False),
+    KeyRow(SEC_NAV, "Enter", "", views=("discover",),                  badge="subscribe", help=False),
+    KeyRow(SEC_NAV, "Esc",       "Back / close overlay / drop focus"),
+    KeyRow(SEC_NAV, "Esc",   "", views=("episodes",),                  badge="back",      help=False),
+    KeyRow(SEC_NAV, "Backspace / b", "Back to the podcast list (episode list)",
+           binds=[_bind([curses.KEY_BACKSPACE, 127, "b"], "back")], views=("episodes",)),
+    KeyRow(SEC_NAV, "/",         "Search episodes or discover podcasts",
+           binds=[_bind(["/"], "search")], views=("podcasts", "episodes", "discover"), badge="search"),
+    KeyRow(SEC_NAV, "d",         "Show episode description and chapters",
+           binds=[_bind(["d"], "describe")], views=("episodes", "queue"), badge="desc"),
+    KeyRow(SEC_NAV, "u",         "Unsubscribe from selected podcast (Podcasts tab)",
+           binds=[_bind(["u"], "unsubscribe")], views=("podcasts",), badge="unsub"),
+    KeyRow(SEC_NAV, "x",         "Delete selected file from cloud (Files tab)",
+           binds=[_bind(["x"], "delete_file")], views=("files",), badge="delete"),
+
+    # ── Player ──
+    KeyRow(SEC_PLAYER, "Space / p", "Play / Pause",
+           binds=[_bind([" ", "p"], "toggle_play")], pbadge="pause", blabel="Spc"),
+    KeyRow(SEC_PLAYER, "← →",    "Seek -30 / +30 seconds",
+           binds=[_bind([curses.KEY_RIGHT], "seek", 30), _bind([curses.KEY_LEFT], "seek", -30)],
+           needs="mpv", pbadge="±30s", blabel="←→"),
+    KeyRow(SEC_PLAYER, "n / N",  "Next / previous chapter",
+           binds=[_bind(["n"], "chapter", 1), _bind(["N"], "chapter", -1)],
+           needs="mpv", pbadge="chapter", blabel="n/N"),
+    KeyRow(SEC_PLAYER, "] / [",  "Speed up / down",
+           binds=[_bind(["]"], "speed", 1), _bind(["["], "speed", -1)], pbadge="speed", blabel="] ["),
+    KeyRow(SEC_PLAYER, "S",      "Skip silence: off / normal / medium / aggressive",
+           binds=[_bind(["S"], "cycle_silence")], pbadge="silence"),
+    KeyRow(SEC_PLAYER, "z",      "Sleep timer (5 / 15 / 30 / 60 min)",
+           binds=[_bind(["z"], "sleep_menu")], pbadge="sleep"),
+
+    # ── Other ──
+    KeyRow(SEC_OTHER, "t",       "Theme selector",
+           binds=[_bind(["t"], "themes")], badge="theme", badge_views=("podcasts",), pbadge="theme"),
+    KeyRow(SEC_OTHER, "?",       "Keymap overlay",
+           binds=[_bind(["?"], "keys")], badge="keys", pbadge="keys"),
+    KeyRow(SEC_OTHER, "q",       "Quit (saves position)", badge="quit", pbadge="quit"),
+]
+
+
+def keymap_markdown():
+    """The keymap as Markdown tables, one per section (used for the README)."""
+    out = []
+    for section in (SEC_NAV, SEC_PLAYER, SEC_OTHER):
+        out += [f"## {section}", "", "| Key | Action |", "|-----|--------|"]
+        out += [f"| `{r.label}` | {r.desc} |" for r in KEYMAP if r.help and r.section == section]
+        out.append("")
+    return "\n".join(out)
+
+
+class Overlay:
+    """An overlay or text-entry mode that takes over the keyboard while open.
+
+    is_open(tui)  whether it is showing
+    close         PocketTUI method that dismisses it (Esc, and q unless text)
+    key           PocketTUI method that receives every other key
+    draw          PocketTUI method that paints it (None when drawn inline)
+    text          True when it has a text field, so q types a letter
+    """
+    __slots__ = ("name", "is_open", "close", "key", "draw", "text")
+
+    def __init__(self, name, is_open, close, key, draw=None, text=False):
+        self.name, self.is_open, self.close = name, is_open, close
+        self.key, self.draw, self.text = key, draw, text
+
+
+# Top first. The first open overlay gets the keys; drawing goes bottom-up so
+# that same overlay is also the one painted on top.
+OVERLAYS = [
+    Overlay("delete",   lambda t: t.del_file_step > 0, "_close_delete",   "_key_delete",   "_draw_delete_file_overlay"),
+    Overlay("unsub",    lambda t: t.unsub_confirm,     "_close_unsub",    "_key_unsub",    "_draw_unsub_confirm_overlay"),
+    Overlay("sleep",    lambda t: t.show_sleep_menu,   "_close_sleep",    "_key_sleep",    "_draw_sleep_menu_overlay"),
+    Overlay("keys",     lambda t: t.show_keys,         "_close_keys",     "_key_keys",     "_draw_keymap_overlay"),
+    Overlay("themes",   lambda t: t.show_themes,       "_close_themes",   "_key_themes",   "_draw_theme_overlay"),
+    Overlay("search",   lambda t: t.searching,         "_close_search",   "_handle_search_key", "_draw_search_overlay", text=True),
+    Overlay("discover", lambda t: t.discover_searching, "_close_discover_search", "_handle_discover_key", None, text=True),
+    Overlay("desc",     lambda t: t.show_desc,         "_close_desc",     "_key_desc",     "_draw_desc_overlay"),
+]
+
+# ─────────────────────────────────────────────
 # Config helpers
 # ─────────────────────────────────────────────
 
-def load_token():
+def _read_config():
     cfg = configparser.ConfigParser()
-    if CONFIG_FILE.exists():
-        cfg.read(CONFIG_FILE)
-        return cfg.get("auth", "token", fallback=None)
-    return None
+    try:
+        if CONFIG_FILE.exists():
+            cfg.read(CONFIG_FILE)
+    except Exception:
+        pass
+    return cfg
+
+
+def _write_config(cfg):
+    """Write config.ini atomically with mode 0600: it holds the auth token."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    fd  = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)   # also when a stale temp file was reused
+        cfg.write(f)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def load_token():
+    if not CONFIG_FILE.exists():
+        return None
+    try:
+        # Files written by older versions were world-readable
+        if CONFIG_FILE.stat().st_mode & 0o077:
+            os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
+    return _read_config().get("auth", "token", fallback=None)
 
 
 def save_config(email, token, uuid):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    cfg = configparser.ConfigParser()
+    cfg = _read_config()
     cfg["auth"] = {"email": email, "token": token, "uuid": uuid}
-    with open(CONFIG_FILE, "w") as f:
-        cfg.write(f)
+    _write_config(cfg)
+
+
+def load_prefs():
+    """Return saved UI preferences: theme name, speed index, skip silence level."""
+    cfg = _read_config()
+    def _int(key, default, lo, hi):
+        try:
+            return max(lo, min(hi, cfg.getint("ui", key, fallback=default)))
+        except Exception:
+            return default
+    return {
+        "theme":        cfg.get("ui", "theme", fallback=""),
+        "speed_idx":    _int("speed_idx", 2, 0, len(SPEEDS) - 1),
+        "skip_silence": _int("skip_silence", 0, 0, 3),
+    }
+
+
+def save_prefs(theme, speed_idx, skip_silence):
+    try:
+        cfg = _read_config()
+        if not cfg.has_section("auth"):
+            return  # logged out while running: do not recreate the file
+        cfg["ui"] = {
+            "theme":        theme,
+            "speed_idx":    str(speed_idx),
+            "skip_silence": str(skip_silence),
+        }
+        _write_config(cfg)
+    except Exception:
+        pass
+
+
+def resume_start(saved, status=0):
+    """Where to start playback given a saved position, in seconds."""
+    # The feed duration is not used to decide "already finished" here: feeds
+    # often understate it (inserted ads), which would restart a long episode.
+    saved = int(saved or 0)
+    if status == 3 or saved < RESUME_MIN:
+        return 0
+    return saved - RESUME_REWIND
+
+
+def is_played(item):
+    """True when a list item (episode or file) shows as played."""
+    dur  = int(item.get("duration", 0) or 0)
+    pos  = int(item.get("playedUpTo", 0) or 0)
+    stat = int(item.get("playingStatus", 0) or 0)
+    return stat == 3 or bool(dur and pos >= dur - 30)
+
+
+def is_finished(pos, duration):
+    """True when a position is close enough to the end to count as played."""
+    pos, duration = float(pos or 0), float(duration or 0)
+    if duration <= 0:
+        return False
+    return pos >= duration - min(PLAYED_TAIL, duration / 2)
 
 
 # ─────────────────────────────────────────────
@@ -143,6 +388,51 @@ def _hex_to_curses_color(hex_color, color_id):
         return True
     except Exception:
         return False
+
+
+_CUBE_LEVELS = (0, 95, 135, 175, 215, 255)
+
+
+def _hex_to_256(hex_color):
+    """Return the nearest color of the fixed xterm 256-color palette.
+    Needs no palette change, so it works on every 256-color terminal."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return curses.COLOR_WHITE
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return curses.COLOR_WHITE
+
+    def nearest(v):
+        return min(range(6), key=lambda i: abs(_CUBE_LEVELS[i] - v))
+
+    ri, gi, bi = nearest(r), nearest(g), nearest(b)
+    cube      = 16 + 36 * ri + 6 * gi + bi
+    cube_dist = ((r - _CUBE_LEVELS[ri]) ** 2 + (g - _CUBE_LEVELS[gi]) ** 2
+                 + (b - _CUBE_LEVELS[bi]) ** 2)
+    # Grayscale ramp: 232..255 are 8, 18, ... 238
+    gray_i    = max(0, min(23, round(((r + g + b) / 3 - 8) / 10)))
+    gray_v    = 8 + 10 * gray_i
+    gray_dist = (r - gray_v) ** 2 + (g - gray_v) ** 2 + (b - gray_v) ** 2
+    return 232 + gray_i if gray_dist < cube_dist else cube
+
+
+def _can_redefine_colors():
+    """Whether exact theme colors can be set by redefining palette entries.
+
+    curses only reports what terminfo claims. Konsole advertises the ability
+    (as xterm-256color) but ignores the request, which left themes showing the
+    stock dark blues and greens of palette slots 16-24. POCKETCLI_TRUECOLOR=1
+    or =0 overrides the guess for other terminals."""
+    forced = os.environ.get("POCKETCLI_TRUECOLOR", "").strip().lower()
+    if forced in ("0", "no", "off", "false"):
+        return False
+    if not (curses.can_change_color() and curses.COLORS >= 256):
+        return False
+    if forced in ("1", "yes", "on", "true"):
+        return True
+    return "KONSOLE_VERSION" not in os.environ
 
 
 def _hex_to_ansi(hex_color):
@@ -211,27 +501,61 @@ def trunc(text, n):
 # API
 # ─────────────────────────────────────────────
 
+class AuthExpired(Exception):
+    """The saved token was rejected by Pocket Casts."""
+
+    def __str__(self):
+        return "Session expired. Run 'pocketcli --logout' and log in again."
+
+
+def _norm_title(text):
+    return re.sub(r"\s+", " ", (text or "")).strip().casefold()
+
+
+def _unique_by_title(items):
+    """Map normalized title -> item, leaving out titles that repeat.
+    A title shared by two episodes identifies neither of them."""
+    seen, dupes = {}, set()
+    for it in items:
+        key = _norm_title(it.get("title"))
+        if not key:
+            continue
+        if key in seen:
+            dupes.add(key)
+        seen[key] = it
+    return {k: v for k, v in seen.items() if k not in dupes}
+
+
 class API:
     def __init__(self, token):
         self.token  = token
         self.client = httpx.Client(
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+                "User-Agent":    USER_AGENT,
+            },
             timeout=15,
         )
         # Separate client for external APIs (no auth headers)
-        self._ext = httpx.Client(timeout=10)
+        self._ext = httpx.Client(
+            timeout=10, follow_redirects=True, headers={"User-Agent": USER_AGENT},
+        )
 
     # ── Internal helpers ──
 
-    def _post(self, path, data=None):
-        r = self.client.post(f"{BASE_URL}{path}", json=data or {})
+    @staticmethod
+    def _check(r):
+        if r.status_code == 401:
+            raise AuthExpired()
         r.raise_for_status()
-        return r.json()
+        return r
+
+    def _post(self, path, data=None):
+        return self._check(self.client.post(f"{BASE_URL}{path}", json=data or {})).json()
 
     def _get(self, path):
-        r = self.client.get(f"{BASE_URL}{path}")
-        r.raise_for_status()
-        return r.json()
+        return self._check(self.client.get(f"{BASE_URL}{path}")).json()
 
     def _itunes_search(self, term, entity="podcast", limit=15):
         """Search iTunes catalog. Returns raw results list."""
@@ -268,8 +592,10 @@ class API:
         """Look up RSS feed URL for a podcast title via iTunes."""
         try:
             results = self._itunes_search(podcast_title, limit=5)
-            if results:
-                return results[0].get("feedUrl")
+            want    = _norm_title(podcast_title)
+            exact   = [r for r in results if _norm_title(r.get("collectionName")) == want]
+            if exact or results:
+                return (exact or results)[0].get("feedUrl")
         except Exception:
             pass
         return None
@@ -277,7 +603,7 @@ class API:
     def podcast_episodes_from_rss(self, feed_url, sync_data=None):
         """Parse an RSS feed and return episode dicts, merged with sync data."""
         try:
-            req = urllib.request.Request(feed_url, headers={"User-Agent": "pocketcli/1.0"})
+            req = urllib.request.Request(feed_url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 xml_data = resp.read()
 
@@ -343,30 +669,127 @@ class API:
         except Exception:
             return []
 
+    def podcast_cache_episodes(self, podcast_uuid):
+        """Episode list from the public Pocket Casts cache, with real UUIDs."""
+        r = self._ext.get(f"{CACHE_URL}/podcast/full/{podcast_uuid}")
+        r.raise_for_status()
+        return (r.json().get("podcast") or {}).get("episodes") or []
+
+    @staticmethod
+    def attach_real_uuids(episodes, cache_eps):
+        """Give RSS episodes their Pocket Casts UUID.
+
+        An RSS item only carries the publisher's guid, and Pocket Casts does
+        not know an episode by that, so syncing with it does nothing. Match by
+        audio URL first, then by a title that is unique on both sides. The
+        guid is kept under "guid". Episodes left unmatched are flagged
+        "unresolved" so the player can say their progress will not sync."""
+        by_url   = {c.get("url"): c for c in cache_eps if c.get("url")}
+        by_title = _unique_by_title(cache_eps)
+        own      = _unique_by_title(episodes)
+        for ep in episodes:
+            match = by_url.get(ep.get("url"))
+            if not match:
+                key = _norm_title(ep.get("title"))
+                if own.get(key) is ep:
+                    match = by_title.get(key)
+            ep["guid"] = ep.get("uuid", "")
+            if match and match.get("uuid"):
+                ep["uuid"] = match["uuid"]
+                if not ep.get("duration"):
+                    ep["duration"] = int(match.get("duration") or 0)
+                ep.pop("unresolved", None)
+            else:
+                ep["unresolved"] = True
+        return episodes
+
+    def user_episode_states(self, podcast_uuid):
+        """Per-episode sync state for one podcast, keyed by episode UUID."""
+        eps = self._post("/user/podcast/episodes", {"uuid": podcast_uuid}).get("episodes", [])
+        return {e.get("uuid"): e for e in eps if e.get("uuid")}
+
     def podcast_episodes(self, podcast_uuid, podcast_title="", feed_url=None):
-        """Fetch episodes via RSS, falling back to PC API if unavailable."""
-        if not feed_url:
-            feed_url = self.podcast_feed_url(podcast_title)
-        if not feed_url:
-            return self._post("/user/podcast/episodes", {
-                "uuid": podcast_uuid, "page": 0, "sort": 3,
-            }).get("episodes", [])
-
-        episodes = self.podcast_episodes_from_rss(feed_url)
-
-        # Merge in-progress data by title match
+        """Fetch episodes via RSS (for descriptions) and the Pocket Casts cache
+        (for real UUIDs), then merge in the listening state."""
         try:
-            in_prog       = self._post("/user/in_progress").get("episodes", [])
-            prog_by_title = {ep.get("title", "").strip(): ep for ep in in_prog}
+            cache_eps = self.podcast_cache_episodes(podcast_uuid)
+        except Exception:
+            cache_eps = []
+
+        episodes = self.podcast_episodes_from_rss(feed_url) if feed_url else []
+        if not episodes and podcast_title:
+            # The stored URL is often the show's website, not its feed
+            looked_up = self.podcast_feed_url(podcast_title)
+            if looked_up and looked_up != feed_url:
+                feed_url = looked_up
+                episodes = self.podcast_episodes_from_rss(feed_url)
+
+        if episodes and cache_eps:
+            self.attach_real_uuids(episodes, cache_eps)
+            if all(ep.get("unresolved") for ep in episodes):
+                # Nothing lines up: the title lookup found another show's feed
+                episodes = []
+
+        if not episodes:
+            if cache_eps:
+                # No usable feed: the cache alone is enough to list and play
+                episodes = [{
+                    "title":         c.get("title", ""),
+                    "uuid":          c.get("uuid", ""),
+                    "url":           c.get("url", ""),
+                    "duration":      int(c.get("duration") or 0),
+                    "publishedAt":   (c.get("published") or "")[:10],
+                    "description":   "",
+                    "playedUpTo":    0,
+                    "playingStatus": 0,
+                } for c in cache_eps]
+            elif not feed_url:
+                return self._post("/user/podcast/episodes", {
+                    "uuid": podcast_uuid, "page": 0, "sort": 3,
+                }).get("episodes", [])
+            else:
+                return []
+
+        self.merge_states(podcast_uuid, episodes)
+        return episodes
+
+    def merge_states(self, podcast_uuid, episodes):
+        """Copy playedUpTo / playingStatus onto episodes, by UUID when we have
+        it and by unique title otherwise."""
+        def _apply(ep, src):
+            ep["playedUpTo"]    = src.get("playedUpTo", 0) or 0
+            ep["playingStatus"] = src.get("playingStatus", 0) or 0
+
+        try:
+            states = self.user_episode_states(podcast_uuid)
             for ep in episodes:
-                match = prog_by_title.get(ep.get("title", "").strip())
-                if match:
-                    ep["playedUpTo"]    = match.get("playedUpTo", 0)
-                    ep["playingStatus"] = match.get("playingStatus", 0)
+                if ep.get("uuid") in states:
+                    _apply(ep, states[ep["uuid"]])
+        except AuthExpired:
+            raise
         except Exception:
             pass
 
-        return episodes
+        try:
+            # Only this podcast's items: titles like "Episode 1" repeat across shows
+            in_prog  = [e for e in self.in_progress()
+                        if (e.get("podcastUuid") or e.get("podcast_uuid")
+                            or e.get("podcast") or podcast_uuid) == podcast_uuid]
+            by_uuid  = {e.get("uuid"): e for e in in_prog if e.get("uuid")}
+            by_title = _unique_by_title(in_prog)
+            own      = _unique_by_title(episodes)
+            for ep in episodes:
+                match = by_uuid.get(ep.get("uuid"))
+                if not match:
+                    key = _norm_title(ep.get("title"))
+                    if own.get(key) is ep:
+                        match = by_title.get(key)
+                if match:
+                    _apply(ep, match)
+        except AuthExpired:
+            raise
+        except Exception:
+            pass
 
     # ── Queue endpoints ──
 
@@ -438,43 +861,59 @@ class API:
 
     # ── Sync ──
 
+    # The sync calls return None on success or a short error message. They
+    # never raise: a failed sync must not interrupt playback, but the caller
+    # shows the message instead of losing progress silently.
+
+    @staticmethod
+    def _err(e):
+        if isinstance(e, httpx.HTTPStatusError):
+            return f"HTTP {e.response.status_code}"
+        return str(e) or e.__class__.__name__
+
     def sync_episode(self, podcast_uuid, episode_uuid, position_secs):
-        """Push playback position to Pocket Casts."""
+        """Push playback position to Pocket Casts.
+
+        The endpoint is /sync/update_episode and the episode goes in "uuid".
+        (/sync/update_episode_position does not exist: it answered 404, which
+        older versions swallowed, so episode progress never reached the server.)"""
         try:
-            self._post("/sync/update_episode_position", {
+            self._post("/sync/update_episode", {
+                "uuid":     episode_uuid,
                 "podcast":  podcast_uuid,
-                "episode":  episode_uuid,
                 "position": int(position_secs),
                 "status":   2,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            return self._err(e)
+        return None
 
-    def sync_file(self, file_uuid, position_secs):
+    def sync_file(self, file_uuid, position_secs, status=2):
         """Push file playback position to Pocket Casts."""
         try:
             self._post("/files", {"files": [{
                 "uuid":          file_uuid,
                 "playedUpTo":    int(position_secs),
-                "playingStatus": 2,
+                "playingStatus": status,
             }]})
-        except Exception:
-            pass
+        except Exception as e:
+            return self._err(e)
+        return None
 
     def delete_file(self, file_uuid):
         """Delete a file from Pocket Casts cloud storage."""
-        r = self.client.delete(f"{BASE_URL}/files/{file_uuid}")
-        r.raise_for_status()
+        self._check(self.client.delete(f"{BASE_URL}/files/{file_uuid}"))
 
     def mark_played(self, podcast_uuid, episode_uuid):
         try:
             self._post("/sync/update_episode", {
+                "uuid":    episode_uuid,
                 "podcast": podcast_uuid,
-                "episode": episode_uuid,
                 "status":  3,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            return self._err(e)
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -482,110 +921,271 @@ class API:
 # ─────────────────────────────────────────────
 
 class MPV:
+    """Owns one mpv process and talks to it over its JSON IPC socket.
+
+    Playback state is read once per UI tick by poll() and cached, so drawing
+    never waits on the socket, and a reply that goes missing keeps the last
+    good value instead of reporting position 0."""
+
     def __init__(self):
         self.sock = None
-        self._id  = 0
         self.proc = None
+        self.path = None
+        self._id   = 0
+        self._gen  = 0      # bumped by launch() and quit(); a stale launch gives up
+        self._buf  = b""
+        self._lock = threading.RLock()
+        self._reset_state()
 
-    def launch(self, url, speed=1.0, start_pos=0, skip_silence=0):
+    def _reset_state(self, pos=0.0):
+        self.pos      = float(pos or 0)
+        self.dur      = 0.0
+        self.paused   = False
+        self.chapter  = 0
+        self.chapters = []
+        self._tick    = 0
+
+    @staticmethod
+    def _kill(proc, path):
         try:
-            os.unlink(SOCKET_PATH)
+            proc.kill()
+            proc.wait(timeout=1)
         except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def launch(self, url, speed=1.0, start_pos=0, skip_silence=0, title=""):
+        """Start mpv and connect to it. Safe to call from a worker thread: a
+        quit() or a newer launch() makes this one clean up and return False."""
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+            old = (self.proc, self.sock, self.path)
+        if old[0]:
+            # Normally quit() ran first; never leave a previous mpv behind
+            self._kill(old[0], old[2] or "")
+        self._teardown(*old)
+        # One socket per process and per launch, so two pocketcli instances
+        # (or two quick launches) never talk to each other's mpv
+        path = os.path.join(_runtime_dir(), f"pocketcli-mpv-{os.getpid()}-{gen}.sock")
+        try:
+            os.unlink(path)
+        except OSError:
             pass
 
         cmd = [
             "mpv", "--no-video",
-            f"--input-ipc-server={SOCKET_PATH}",
+            f"--input-ipc-server={path}",
             "--really-quiet",
             f"--speed={speed}",
         ]
-        if start_pos and int(start_pos) > 5:
+        if start_pos and int(start_pos) > 0:
             cmd += [f"--start={int(start_pos)}"]
+        if title:
+            cmd += [f"--force-media-title={title}"]
 
         af = SILENCE_FILTERS.get(skip_silence)
         if af:
             cmd += [f"--af={af}"]
 
-        cmd.append(url)
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # "--" ends the options: a URL from a feed is never read as a flag
+        cmd += ["--", url]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
 
-        for _ in range(20):
+        with self._lock:
+            if gen != self._gen:
+                self._kill(proc, path)
+                return False
+            self.proc, self.path, self.sock, self._buf = proc, path, None, b""
+            self._reset_state(start_pos)
+
+        for _ in range(40):
+            if proc.poll() is not None:
+                break
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(SOCKET_PATH)
-                self.sock.settimeout(0.5)
-                return True
-            except Exception:
-                self.sock = None
-                time.sleep(0.2)
+                sock.connect(path)
+            except OSError:
+                sock.close()
+                with self._lock:
+                    if gen != self._gen:
+                        self._kill(proc, path)
+                        return False
+                time.sleep(0.1)
+                continue
+            with self._lock:
+                if gen != self._gen:
+                    sock.close()
+                    self._kill(proc, path)
+                    return False
+                self.sock = sock
+            return True
+
+        # Never connected: do not leave an mpv we cannot control
+        self._kill(proc, path)
+        with self._lock:
+            if gen == self._gen:
+                self.proc = self.path = None
         return False
 
-    def _cmd(self, cmd):
-        if not self.sock:
-            return None
-        try:
-            self._id += 1
-            msg = json.dumps({"command": cmd, "request_id": self._id}) + "\n"
-            self.sock.sendall(msg.encode())
-            buf = b""
-            while True:
-                try:
-                    chunk = self.sock.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if b"\n" in buf:
-                        break
-                except socket.timeout:
-                    break
-            for line in buf.split(b"\n"):
-                line = line.strip()
-                if line:
-                    try:
-                        resp = json.loads(line)
-                        if resp.get("request_id") == self._id:
-                            return resp.get("data")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return None
+    def _cmd(self, cmd, timeout=0.5):
+        """Send one command and return its reply data, or None.
 
-    # Properties
-    def get_position(self):   return self._cmd(["get_property", "time-pos"]) or 0.0
-    def get_duration(self):   return self._cmd(["get_property", "duration"]) or 0.0
-    def get_paused(self):     return self._cmd(["get_property", "pause"]) or False
-    def get_speed(self):      return self._cmd(["get_property", "speed"]) or 1.0
-    def is_done(self):        return self._cmd(["get_property", "idle-active"]) is True
-    def get_chapter(self):    return self._cmd(["get_property", "chapter"]) or 0
-    def get_chapter_list(self):
-        data = self._cmd(["get_property", "chapter-list"])
-        return data if isinstance(data, list) else []
+        mpv also writes event lines on the same socket at any time, so this
+        reads until the line carrying our request_id arrives, keeping any
+        leftover bytes for the next call."""
+        with self._lock:
+            sock = self.sock
+            if not sock:
+                return None
+            self._id += 1
+            rid = self._id
+            try:
+                sock.settimeout(timeout)
+                sock.sendall((json.dumps({"command": cmd, "request_id": rid}) + "\n").encode())
+                deadline = time.time() + timeout
+                while True:
+                    while b"\n" in self._buf:
+                        line, self._buf = self._buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            resp = json.loads(line)
+                        except ValueError:
+                            continue
+                        if resp.get("request_id") == rid:
+                            if resp.get("error", "success") != "success":
+                                return None
+                            return resp.get("data")
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return None
+                    sock.settimeout(remaining)
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise OSError("mpv closed the socket")
+                    self._buf += chunk
+            except socket.timeout:
+                return None
+            except OSError:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                if self.sock is sock:
+                    self.sock = None
+                return None
+
+    def poll(self):
+        """Refresh the cached playback state. Called once per UI tick."""
+        if not self.sock or not self.is_running():
+            return
+        pos = self._cmd(["get_property", "time-pos"])
+        if not isinstance(pos, (int, float)) or isinstance(pos, bool):
+            return  # slow or closing: keep the last good values this tick
+        self.pos = float(pos)
+        paused = self._cmd(["get_property", "pause"])
+        if isinstance(paused, bool):
+            self.paused = paused
+        if self._tick % 10 == 0:
+            dur = self._cmd(["get_property", "duration"])
+            if isinstance(dur, (int, float)) and not isinstance(dur, bool):
+                self.dur = float(dur)
+            ch = self._cmd(["get_property", "chapter"])
+            self.chapter = ch if isinstance(ch, int) and not isinstance(ch, bool) else 0
+            chapters = self._cmd(["get_property", "chapter-list"])
+            self.chapters = chapters if isinstance(chapters, list) else []
+        self._tick += 1
+
+    # Cached properties (see poll)
+    def get_position(self):      return self.pos
+    def get_duration(self):      return self.dur
+    def get_paused(self):        return self.paused
+    def get_chapter(self):       return self.chapter
+    def get_chapter_list(self):  return self.chapters
 
     # Commands
-    def next_chapter(self):   self._cmd(["add", "chapter",  1])
-    def prev_chapter(self):   self._cmd(["add", "chapter", -1])
-    def pause_toggle(self):   self._cmd(["cycle", "pause"])
-    def seek(self, secs):     self._cmd(["seek", secs, "relative"])
-    def set_speed(self, s):   self._cmd(["set_property", "speed", s])
+    def next_chapter(self):
+        self._cmd(["add", "chapter",  1]); self._tick = 0
+    def prev_chapter(self):
+        self._cmd(["add", "chapter", -1]); self._tick = 0
+    def seek(self, secs):
+        self._cmd(["seek", secs, "relative"])
+    def set_speed(self, s):
+        self._cmd(["set_property", "speed", s])
+
+    def pause_toggle(self):
+        self._cmd(["cycle", "pause"])
+        paused = self._cmd(["get_property", "pause"])
+        if isinstance(paused, bool):
+            self.paused = paused
+
+    def pause(self):
+        """Pause (unlike pause_toggle, never resumes an already paused player)."""
+        self._cmd(["set_property", "pause", True])
+        self.paused = True
+
+    def set_skip_silence(self, level):
+        """Apply a skip silence level to the running mpv right away."""
+        self._cmd(["af", "set", SILENCE_FILTERS.get(level) or ""])
+
+    def _teardown(self, proc, sock, path):
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        with self._lock:
+            if self.proc is proc:
+                self.proc = None
+            if self.sock is sock:
+                self.sock = None
+            if self.path == path:
+                self.path = None
+            self._buf = b""
 
     def quit(self):
-        self._cmd(["quit"])
-        if self.proc:
+        with self._lock:
+            self._gen += 1   # cancels a launch() still waiting to connect
+            proc, sock, path = self.proc, self.sock, self.path
+        if sock:
+            self._cmd(["quit"], timeout=0.3)
+        if proc:
             try:
-                self.proc.wait(timeout=2)
+                if not sock:
+                    proc.terminate()
+                proc.wait(timeout=2)
             except Exception:
-                self.proc.kill()
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
-        self.proc = None
+                self._kill(proc, path or "")
+        self._teardown(proc, sock, path)
+
+    def reap(self):
+        """Clean up after mpv exited by itself. Returns its exit code."""
+        with self._lock:
+            proc, sock, path = self.proc, self.sock, self.path
+        code = proc.poll() if proc else None
+        self._teardown(proc, sock, path)
+        return code
 
     def is_running(self):
-        return self.proc is not None and self.proc.poll() is None
+        proc = self.proc
+        return proc is not None and proc.poll() is None
 
+    def has_exited(self):
+        """True when an mpv we started has ended and was not cleaned up yet."""
+        proc = self.proc
+        return proc is not None and proc.poll() is not None
 
 # ─────────────────────────────────────────────
 # Login screen
@@ -621,7 +1221,7 @@ def curses_login(stdscr):
     Flow:
       1. Draw POCKET (orange) + CLI (green) ASCII art, tagline, separator.
       2. Blink '█' cursor at the end of the last CLI art line until any key
-         is pressed — that keypress is discarded (it is not part of the email).
+         is pressed - that keypress is discarded (it is not part of the email).
       3. Show Email / Password prompts and collect credentials.
       4. POST to Pocket Casts login endpoint and save the token.
 
@@ -632,8 +1232,8 @@ def curses_login(stdscr):
     # ── Color pairs ──────────────────────────────────────────────────────────
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_RED,   -1)   # POCKET — warm red/orange
-    curses.init_pair(2, curses.COLOR_GREEN, -1)   # CLI — matrix green
+    curses.init_pair(1, curses.COLOR_RED,   -1)   # POCKET - warm red/orange
+    curses.init_pair(2, curses.COLOR_GREEN, -1)   # CLI - matrix green
     curses.init_pair(3, curses.COLOR_WHITE, -1)   # tagline / separator
 
     curses.curs_set(0)    # hide text cursor during art phase
@@ -688,14 +1288,14 @@ def curses_login(stdscr):
             except Exception:
                 pass
 
-        # Tagline — centered horizontally
+        # Tagline - centered horizontally
         try:
             tl_col = max(0, (w - len(tagline)) // 2)
             stdscr.addstr(tagline_row, tl_col, tagline, curses.color_pair(3))
         except Exception:
             pass
 
-        # Separator — same width and left edge as POCKET
+        # Separator - same width and left edge as POCKET
         try:
             stdscr.addstr(sep_row, cx, "─" * min(art_w, w - cx),
                           curses.color_pair(3))
@@ -782,7 +1382,7 @@ def curses_login(stdscr):
     stdscr.refresh()
     password = stdscr.getstr(pass_row, cx + 11, 60).decode().strip()
 
-    # ── Authenticate — retry loop ─────────────────────────────────────────────
+    # ── Authenticate - retry loop ─────────────────────────────────────────────
     while True:
         curses.curs_set(0)
         try:
@@ -857,6 +1457,7 @@ class PocketTUI:
         # ── Navigation state ──
         self.view       = self.VIEW_PODCASTS
         self.podcasts   = []
+        self.pods_loaded = False     # False until the first podcast list answer
         self.episodes   = []
         self.queue_items = []
         self.files_items = []
@@ -875,11 +1476,16 @@ class PocketTUI:
         self.discover_mode_cursor = 0
 
         # ── Player state ──
+        prefs = load_prefs()
         self.playing_pod  = None
         self.playing_ep   = None
-        self.speed_idx    = 2        # index into SPEEDS; default 1.0x
-        self.skip_silence = 0        # 0=off 1=normal 2=medium 3=aggressive
+        self.speed_idx    = prefs["speed_idx"]      # index into SPEEDS; default 1.0x
+        self.skip_silence = prefs["skip_silence"]   # 0=off 1=normal 2=medium 3=aggressive
         self.last_sync    = 0
+        self.loading_stream = False  # True while a stream URL is fetched / mpv starts
+        self._play_gen      = 0      # bumped per play request; stale workers give up
+        self._sync_warned   = False  # a sync failure is reported once per episode
+        self._quit          = False
         self.sleep_timer_end  = 0    # epoch when timer fires, 0=inactive
         self.show_sleep_menu  = False
         self.sleep_cursor     = 0
@@ -888,6 +1494,7 @@ class PocketTUI:
         self.show_desc   = False
         self.desc_offset = 0
         self.show_keys   = False
+        self.keys_offset = 0
         self.show_themes = False
         self.theme_cursor = 0
 
@@ -925,13 +1532,14 @@ class PocketTUI:
 
         # ── Theme setup ──
         self.THEMES        = _load_themes()
-        self.current_theme = 0
+        self.current_theme = next(
+            (i for i, t in enumerate(self.THEMES) if t["name"] == prefs["theme"]), 0)
 
         curses.start_color()
         curses.use_default_colors()
-        self._truecolor = curses.can_change_color() and curses.COLORS >= 256
+        self._truecolor = _can_redefine_colors()
         self._tc_ids    = list(range(16, 25))
-        self._apply_theme(0)
+        self._apply_theme(self.current_theme)
 
         curses.curs_set(0)
         self.scr.nodelay(True)
@@ -950,7 +1558,10 @@ class PocketTUI:
                 cid = self._tc_ids[slot]
                 if _hex_to_curses_color(hex_val, cid):
                     return cid
-            return _hex_to_ansi(hex_val) if hex_val else curses.COLOR_WHITE
+            if not hex_val:
+                return curses.COLOR_WHITE
+            # No palette redefinition: nearest fixed color the terminal has
+            return _hex_to_256(hex_val) if curses.COLORS >= 256 else _hex_to_ansi(hex_val)
 
         accent = color(t["accent"],    0)
         active = color(t["green"],     1)
@@ -981,8 +1592,10 @@ class PocketTUI:
                 pods.sort(key=lambda p: p.get("title", "").lower())
                 self.podcasts         = pods
                 self.subscribed_uuids = {p.get("uuid", "") for p in pods}
+                self.pods_loaded      = True
                 self.status("")
             except Exception as e:
+                self.pods_loaded = True
                 self.status(f"Error: {e}", error=True)
         threading.Thread(target=_load, daemon=True).start()
 
@@ -1005,11 +1618,6 @@ class PocketTUI:
                 eps = self.api.podcast_episodes(
                     podcast["uuid"], podcast.get("title", ""), feed_url=feed_url
                 )
-                if gen != self._load_gen:
-                    return
-                if not eps and feed_url:
-                    # Retry without cached feed URL
-                    eps = self.api.podcast_episodes(podcast["uuid"], podcast.get("title", ""))
                 if gen != self._load_gen:
                     return
                 self.episodes = eps
@@ -1082,71 +1690,112 @@ class PocketTUI:
 
     def _stop_current(self):
         """Sync position and stop mpv if something is playing."""
+        self._play_gen += 1          # cancels a play request still in flight
+        self.loading_stream = False
         if self.mpv.is_running() and self.playing_pod and self.playing_ep:
-            self._push_sync(self.mpv.get_position())
-            self.mpv.quit()
+            pos = self.mpv.get_position()
+            self._remember_position(pos)
+            self._push_sync(pos)
+        self.mpv.quit()
 
-    def _push_sync(self, pos):
-        """Push position to API based on whether it's a file or episode."""
+    def _remember_position(self, pos):
+        """Keep the local copy of the episode in step with what was played, so
+        the lists and a later resume do not wait for the next refresh."""
+        if self.playing_ep and pos and pos >= 1:
+            self.playing_ep["playedUpTo"] = int(pos)
+            if int(self.playing_ep.get("playingStatus") or 0) != 3:
+                self.playing_ep["playingStatus"] = 2
+
+    def _push_sync(self, pos, status=2, wait=False):
+        """Push position to the API for the current file or episode.
+        status 3 marks it as played. wait=True blocks briefly (used on exit)."""
         pod = self.playing_pod
         ep  = self.playing_ep
-        if not pod or not ep:
+        if not pod or not ep or not pod.get("uuid"):
             return
+        if ep.get("unresolved"):
+            return  # Pocket Casts has no id for this episode: nothing to sync to
+        if status == 2 and (not pos or pos < 1):
+            return  # never overwrite real progress with a position of zero
+
         def _sync():
             if pod["uuid"] == "__files__":
-                self.api.sync_file(ep["uuid"], pos)
+                err = self.api.sync_file(ep["uuid"], pos, status)
+            elif status == 3:
+                err = self.api.mark_played(pod["uuid"], ep["uuid"])
             else:
-                self.api.sync_episode(pod["uuid"], ep["uuid"], pos)
-        threading.Thread(target=_sync, daemon=True).start()
+                err = self.api.sync_episode(pod["uuid"], ep["uuid"], pos)
+            if not err:
+                self._sync_warned = False
+            elif not self._sync_warned:
+                self._sync_warned = True
+                self.status(f"Sync failed: {err}", error=True)
+
+        t = threading.Thread(target=_sync, daemon=True)
+        t.start()
+        if wait:
+            t.join(timeout=5)
+
+    def _begin_playback(self, pod, ep, get_url, missing_msg):
+        """Stop what is playing and start ep. Fetching the stream URL and
+        starting mpv happen in a worker so the UI never freezes."""
+        self._stop_current()
+        self.playing_pod    = pod
+        self.playing_ep     = ep
+        self._sync_warned   = False
+        self.loading_stream = True
+        self.last_sync      = time.time()   # first periodic sync is 30s from now
+        gen   = self._play_gen
+        title = ep.get("title", "")
+        self.status("Fetching stream...")
+
+        def _run():
+            try:
+                url = get_url()
+            except Exception:
+                url = None
+            if gen != self._play_gen:
+                return
+            if not url:
+                self.loading_stream = False
+                self.status(missing_msg, error=True)
+                return
+
+            start = resume_start(
+                ep.get("playedUpTo") or ep.get("played_up_to"),
+                int(ep.get("playingStatus") or 0),
+            )
+            ok = self.mpv.launch(url, speed=SPEEDS[self.speed_idx], start_pos=start,
+                                 skip_silence=self.skip_silence, title=title)
+            if gen != self._play_gen:
+                return
+            self.loading_stream = False
+            if not ok:
+                self.status("Could not start mpv (is it installed?)", error=True)
+                return
+
+            self.last_sync = time.time()
+            if ep.get("unresolved"):
+                self.status("Playing. Pocket Casts does not list this episode: progress will not sync")
+            else:
+                self.status(f"Playing: {title[:50]}")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def play(self, podcast_dict, episode_dict):
-        self._stop_current()
-        self.playing_pod = podcast_dict
-        self.playing_ep  = episode_dict
-        self.status("Fetching stream...")
-        self.draw()
-
-        url = self.api.episode_stream_url(podcast_dict["uuid"], episode_dict["uuid"])
-        if not url:
-            url = episode_dict.get("url") or episode_dict.get("streamUrl")
-        if not url:
-            self.status("Could not get episode URL", error=True)
-            return
-
-        saved = int(episode_dict.get("playedUpTo") or episode_dict.get("played_up_to") or 0)
-        ok    = self.mpv.launch(url, speed=SPEEDS[self.speed_idx],
-                                start_pos=saved, skip_silence=self.skip_silence)
-        if not ok:
-            self.status("Could not start mpv", error=True)
-            return
-
-        self.last_sync = time.time()
-        self.status(f"Playing: {episode_dict.get('title', '')[:50]}")
+        def _url():
+            url = None
+            if not episode_dict.get("unresolved"):
+                url = self.api.episode_stream_url(podcast_dict["uuid"], episode_dict["uuid"])
+            return url or episode_dict.get("url") or episode_dict.get("streamUrl")
+        self._begin_playback(podcast_dict, episode_dict, _url, "Could not get episode URL")
 
     def play_file(self, file_dict):
-        self._stop_current()
-        self.playing_pod = {"uuid": "__files__", "title": "Files"}
-        self.playing_ep  = file_dict
-        self.status("Fetching stream...")
-        self.draw()
-
-        try:
-            url = self.api.file_stream_url(file_dict["uuid"])
-        except Exception:
-            url = None
-        if not url:
-            self.status("Could not get file URL", error=True)
-            return
-
-        saved = int(file_dict.get("playedUpTo") or 0)
-        ok    = self.mpv.launch(url, speed=SPEEDS[self.speed_idx],
-                                start_pos=saved, skip_silence=self.skip_silence)
-        if not ok:
-            self.status("Could not start mpv", error=True)
-            return
-
-        self.last_sync = time.time()
-        self.status(f"Playing: {file_dict.get('title', '')[:50]}")
+        self._begin_playback(
+            {"uuid": "__files__", "title": "Files"}, file_dict,
+            lambda: self.api.file_stream_url(file_dict["uuid"]),
+            "Could not get file URL",
+        )
 
     def sync_position(self):
         """Periodic sync every 30s while playing."""
@@ -1155,7 +1804,9 @@ class PocketTUI:
         now = time.time()
         if now - self.last_sync >= 30:
             self.last_sync = now
-            self._push_sync(self.mpv.get_position())
+            pos = self.mpv.get_position()
+            self._remember_position(pos)
+            self._push_sync(pos)
 
     def check_sleep_timer(self):
         """Pause playback when sleep timer expires."""
@@ -1163,23 +1814,45 @@ class PocketTUI:
             return
         if time.time() >= self.sleep_timer_end:
             self.sleep_timer_end = 0
-            if self.mpv.is_running():
-                self._push_sync(self.mpv.get_position())
-                self.mpv.pause_toggle()
-                self.status("Sleep timer — paused.")
+            pos = self.mpv.get_position()
+            self._remember_position(pos)
+            self._push_sync(pos)
+            self.mpv.pause()
+            self.status("Sleep timer: paused.")
 
     def check_finished(self):
-        """Mark episode as played when mpv exits naturally."""
-        if not self.mpv.is_running() and self.playing_ep and self.mpv.proc is not None:
-            if self.playing_pod and self.playing_pod["uuid"] != "__files__":
-                pod, ep = self.playing_pod, self.playing_ep
-                threading.Thread(
-                    target=lambda: self.api.mark_played(pod["uuid"], ep["uuid"]),
-                    daemon=True,
-                ).start()
+        """React to mpv ending by itself.
+
+        mpv exits with 0 when the file played to its end. Only then, and only
+        near the end of the episode, is it marked as played. Any other exit
+        (bad URL, network error, crash) keeps the position instead, so a
+        failed stream never shows up as "played" in Pocket Casts."""
+        if self.loading_stream or not self.mpv.has_exited():
+            return
+        pos  = self.mpv.get_position()
+        dur  = self.mpv.get_duration()
+        code = self.mpv.reap()
+        pod, ep = self.playing_pod, self.playing_ep
+        if not pod or not ep:
+            return
+        if not dur:
+            dur = float(ep.get("duration") or 0)
+
+        # With skip silence the reported position runs behind the real one,
+        # so there the clean exit code alone decides.
+        ended = code == 0 and (is_finished(pos, dur) or self.skip_silence or not dur)
+        title = ep.get("title", "")[:50]
+        if ended:
+            ep["playingStatus"] = 3
+            ep["playedUpTo"]    = int(dur or pos)
+            self._push_sync(dur or pos, status=3)
+            self.status(f"Finished: {title}")
             self.playing_ep  = None
             self.playing_pod = None
-            self.mpv.proc    = None
+        else:
+            self._remember_position(pos)
+            self._push_sync(pos)
+            self.status(f"Playback stopped (mpv exit code {code}). Press space to resume.", error=True)
 
     # ─────────────────────────────────────────
     # Subscribe / Unsubscribe actions
@@ -1294,7 +1967,27 @@ class PocketTUI:
         def _load():
             try:
                 feed_url = pod.get("feedUrl") or self.api.podcast_feed_url(pod.get("title", ""))
-                self.episodes  = self.api.podcast_episodes_from_rss(feed_url) if feed_url else []
+                eps      = self.api.podcast_episodes_from_rss(feed_url) if feed_url else []
+
+                # A search result only carries an iTunes id. Ask Pocket Casts
+                # for its own ids so progress can sync; without them the
+                # episodes still play, flagged as unresolved.
+                pc_uuid = self.api.resolve_podcast_uuid(feed_url) if feed_url else None
+                cache   = []
+                if pc_uuid:
+                    try:
+                        cache = self.api.podcast_cache_episodes(pc_uuid)
+                    except Exception:
+                        cache = []
+                if cache:
+                    pod["uuid"] = pc_uuid
+                    self.api.attach_real_uuids(eps, cache)
+                    self.api.merge_states(pc_uuid, eps)
+                else:
+                    for ep in eps:
+                        ep["unresolved"] = True
+
+                self.episodes  = eps
                 self.ep_cursor = self.ep_offset = 0
                 self.view      = self.VIEW_EPISODES
                 self.status(f"Loaded {len(self.episodes)} episodes")
@@ -1334,14 +2027,10 @@ class PocketTUI:
 
         self._draw_footer(h - 1, w)
 
-        # Overlays (drawn last, on top)
-        self._draw_desc_overlay()
-        self._draw_search_overlay()
-        self._draw_theme_overlay()
-        self._draw_keymap_overlay()
-        self._draw_sleep_menu_overlay()
-        self._draw_unsub_confirm_overlay()
-        self._draw_delete_file_overlay()
+        # Overlays, bottom-up: the one that owns the keys is painted last
+        for ov in reversed(OVERLAYS):
+            if ov.draw and ov.is_open(self):
+                getattr(self, ov.draw)()
 
         self.scr.refresh()
 
@@ -1462,10 +2151,8 @@ class PocketTUI:
         title = f.get("title", "this file")
         dur   = int(f.get("duration", 0) or 0)
         pos   = int(f.get("playedUpTo", 0) or 0)
-        stat  = int(f.get("playingStatus", 0) or 0)
 
         is_second = self.del_file_step == 2
-        played = stat == 3 or (dur and pos >= dur - 30)
 
         if is_second:
             warn  = "Not finished! Delete from cloud anyway?"
@@ -1546,7 +2233,9 @@ class PocketTUI:
 
     def _draw_list(self, top, height, w, items, cursor, offset, fmt):
         if not items:
-            msg = "Loading..." if "Loading" in self.status_msg else "No results."
+            loading = "Loading" in self.status_msg or (
+                self.view == self.VIEW_PODCASTS and not self.pods_loaded)
+            msg = "Loading..." if loading else "No results."
             self.scr.attron(curses.color_pair(3))
             self.scr.addstr(top + 1, 2, msg)
             self.scr.attroff(curses.color_pair(3))
@@ -1760,16 +2449,12 @@ class PocketTUI:
         ep_title  = self.playing_ep.get("title", "")  if self.playing_ep  else ""
         pod_title = self.playing_pod.get("title", "") if self.playing_pod else ""
 
-        # Chapter info (cached every 10 ticks to reduce IPC calls)
+        # Chapter info (refreshed about once a second by MPV.poll)
         chapter_name = ""
         if self.mpv.is_running():
-            ch_idx = self.mpv.get_chapter()
-            if not hasattr(self, "_ch_list_cache") or self._ch_list_tick % 10 == 0:
-                self._ch_list_cache = self.mpv.get_chapter_list()
-                self._ch_list_tick  = 0
-            self._ch_list_tick = getattr(self, "_ch_list_tick", 0) + 1
-            ch_list = self._ch_list_cache
-            if ch_list and ch_idx is not None and 0 <= ch_idx < len(ch_list):
+            ch_idx  = self.mpv.get_chapter()
+            ch_list = self.mpv.get_chapter_list()
+            if ch_list and 0 <= ch_idx < len(ch_list):
                 chapter_name = ch_list[ch_idx].get("title", "")
 
         # Line 1: podcast / episode titles (chapter overrides if available)
@@ -1804,7 +2489,8 @@ class PocketTUI:
             self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
             self.scr.attron(curses.color_pair(3))
             try:
-                self.scr.addstr(top + 1, 18, "  press space to continue")
+                hint = "  loading..." if self.loading_stream else "  press space to continue"
+                self.scr.addstr(top + 1, 18, hint)
             except Exception:
                 pass
             self.scr.attroff(curses.color_pair(3))
@@ -1852,9 +2538,7 @@ class PocketTUI:
 
         # Line 4: key badges
         self._draw_badges(top + 3, w, [
-            ("Spc", "pause"), ("←→", "±30s"), ("n/N", "chapter"),
-            ("]", "faster"), ("[", "slower"), ("S", "silence"),
-            ("z", "sleep"),  ("t", "theme"),  ("?", "keys"), ("q", "quit"),
+            (row.blabel, row.pbadge) for row in KEYMAP if row.pbadge
         ])
 
     # ── Footer ──
@@ -1881,14 +2565,10 @@ class PocketTUI:
         if self.mpv.is_running() or self.playing_ep:
             return
 
-        NAV_BADGES = {
-            self.VIEW_PODCASTS: [("↑↓", "navigate"), ("Enter", "open"), ("u", "unsub"),  ("/", "search"), ("t", "theme"), ("?", "keys"), ("q", "quit")],
-            self.VIEW_EPISODES: [("↑↓", "navigate"), ("Enter", "play"), ("d", "desc"),   ("/", "search"), ("Esc", "back"), ("?", "keys"), ("q", "quit")],
-            self.VIEW_QUEUE:    [("↑↓", "navigate"), ("Enter", "play"), ("d", "desc"),   ("?", "keys"), ("q", "quit")],
-            self.VIEW_FILES:    [("↑↓", "navigate"), ("Enter", "play"), ("x", "delete"), ("?", "keys"), ("q", "quit")],
-            self.VIEW_DISCOVER: [("↑↓", "navigate"), ("Enter", "subscribe"), ("/", "search"), ("?", "keys"), ("q", "quit")],
-        }
-        self._draw_badges(y, w, NAV_BADGES.get(self.view, []))
+        self._draw_badges(y, w, [
+            (row.blabel, row.badge) for row in KEYMAP
+            if row.badge and (row.badge_views is None or self.view in row.badge_views)
+        ])
 
     def _draw_badges(self, y, w, badges):
         x = 1
@@ -2107,15 +2787,18 @@ class PocketTUI:
             return
         h, w = self.scr.getmaxyx()
         ow = min(w - 6, 40)
-        oh = len(self.THEMES) + 4
+        oh = min(h - 2, len(self.THEMES) + 4)
         ox = (w - ow) // 2
         oy = max(1, (h - oh) // 2)
 
         self._overlay_box(oy, ox, oh, ow, title="Theme")
 
-        for i, theme in enumerate(self.THEMES):
-            sel    = i == self.theme_cursor
-            active = i == self.current_theme
+        # Show a window of the list that always contains the cursor
+        rows  = max(1, oh - 4)
+        first = max(0, min(self.theme_cursor - rows // 2, len(self.THEMES) - rows))
+        for i, theme in enumerate(self.THEMES[first: first + rows]):
+            sel    = first + i == self.theme_cursor
+            active = first + i == self.current_theme
             bullet = "●" if active else "○"
             try:
                 if sel:
@@ -2141,66 +2824,45 @@ class PocketTUI:
         if not self.show_keys:
             return
         h, w = self.scr.getmaxyx()
-        ow = min(w - 6, 60)
-        oh = 34
+
+        # (key label, description); description None marks a section heading
+        lines = []
+        for section in (SEC_NAV, SEC_PLAYER, SEC_OTHER):
+            if lines:
+                lines.append(("", None))
+            lines.append((section, None))
+            lines += [(r.label, r.desc) for r in KEYMAP if r.help and r.section == section]
+
+        ow = min(w - 6, 72)
+        oh = min(h - 2, len(lines) + 2)
         ox = (w - ow) // 2
         oy = max(1, (h - oh) // 2)
+        max_lines        = max(1, oh - 2)
+        self.keys_offset = max(0, min(self.keys_offset, len(lines) - max_lines))
 
         self._overlay_box(oy, ox, oh, ow, title="Keymap")
 
-        KEYS = [
-            ("Navigation",       None),
-            ("Tab",              "Focus: content → tab bar → sub-menu"),
-            ("Shift+Tab",        "Focus: reverse direction"),
-            ("← →",             "Move between tabs or sub-menu items"),
-            ("Enter",            "Select focused tab / item"),
-            ("1-6",              "Jump directly to tab"),
-            ("↑↓ / j k",        "Navigate list"),
-            ("PgUp PgDn",        "Jump page"),
-            ("Esc",              "Back / close overlay / lose focus"),
-            ("/",                "Search"),
-            ("d",                "Episode description"),
-            ("u",                "Unsubscribe (Podcasts tab)"),
-            ("x",                "Delete file from cloud (Files tab)"),
-            ("",                 None),
-            ("Player",           None),
-            ("Space / p",        "Play / Pause"),
-            ("← →",             "Seek ±30s"),
-            ("n / N",            "Next / Prev chapter"),
-            ("] / [",            "Speed up / down"),
-            ("S",                "Cycle skip silence"),
-            ("z",                "Sleep timer — 5/15/30/60 min (↑↓ Enter to select)"),
-            ("",                 None),
-            ("Other",            None),
-            ("t",                "Theme selector"),
-            ("?",                "This keymap"),
-            ("q",                "Quit"),
-        ]
-
-        row = 1
-        for key, action in KEYS:
-            if row >= oh - 1:
-                break
+        for i, (key, action) in enumerate(lines[self.keys_offset: self.keys_offset + max_lines]):
             try:
-                if action is None and key == "":
-                    row += 1
-                    continue
-                elif action is None:
+                if action is None:
                     self.scr.attron(curses.color_pair(2) | curses.A_BOLD)
-                    self.scr.addstr(oy + row, ox + 2, key)
+                    self.scr.addstr(oy + 1 + i, ox + 2, key)
                     self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
                 else:
                     self.scr.attron(curses.color_pair(3))
-                    self.scr.addstr(oy + row, ox + 4, f"{key:<16}")
+                    self.scr.addstr(oy + 1 + i, ox + 4, f"{key:<16}")
                     self.scr.attroff(curses.color_pair(3))
-                    self.scr.addstr(oy + row, ox + 21, action)
+                    self.scr.addstr(oy + 1 + i, ox + 21, trunc(action, ow - 23))
             except Exception:
                 pass
-            row += 1
 
         self.scr.attron(curses.color_pair(3))
         try:
-            self.scr.addstr(oy + oh - 1, ox + 2, "┤ ? / Esc = close ├")
+            more = len(lines) - self.keys_offset - max_lines
+            if more > 0:
+                hint = f"↓ {more} more"
+                self.scr.addstr(oy + oh - 1, ox + ow - len(hint) - 4, hint)
+            self.scr.addstr(oy + oh - 1, ox + 2, "┤ ↑↓=scroll  ? / Esc = close ├")
         except Exception:
             pass
         self.scr.attroff(curses.color_pair(3))
@@ -2274,129 +2936,47 @@ class PocketTUI:
     # Input handling
     # ─────────────────────────────────────────
 
-    def handle_key(self, key):
-        vis = self._visible_rows()
+    def _top_overlay(self):
+        """The open overlay that owns the keyboard, or None."""
+        for ov in OVERLAYS:
+            if ov.is_open(self):
+                return ov
+        return None
 
-        # ── q: close overlays then quit ──
-        if key in (ord("q"), ord("Q")):
-            if self.show_desc:          self.show_desc = False
-            elif self.searching:
-                self.searching = False; self.search_query = ""
-            elif self.discover_searching:
-                self._close_discover_search()
-            elif self.unsub_confirm:
-                self.unsub_confirm = False; self.unsub_target = None
-            elif self.show_sleep_menu:
-                self.show_sleep_menu = False
-            elif self.del_file_step > 0:
-                self.del_file_step = 0; self.del_file_target = None
+    def handle_key(self, key):
+        """Route one key press. Returns False when the app should quit."""
+        top = self._top_overlay()
+
+        # ── q: close what is open, then quit (a text field types the letter) ──
+        if key in (ord("q"), ord("Q")) and not (top and top.text):
+            if top:
+                getattr(self, top.close)()
             elif self.focus_level != self.FOCUS_CONTENT:
                 self.focus_level = self.FOCUS_CONTENT
             else:
                 return False
             return True
 
-        # ── Esc: back in priority order ──
+        # ── Esc: close what is open, then step back ──
         if key == 27:
-            if self.show_keys:      self.show_keys  = False
-            elif self.show_desc:    self.show_desc  = False
-            elif self.show_themes:  self.show_themes = False
-            elif self.unsub_confirm:
-                self.unsub_confirm = False; self.unsub_target = None
-            elif self.show_sleep_menu:
-                self.show_sleep_menu = False
-            elif self.del_file_step > 0:
-                self.del_file_step = 0; self.del_file_target = None
-            elif self.searching:
-                self.searching = False; self.search_query = ""
-            elif self.discover_searching:
-                self._close_discover_search()
-            elif self.focus_level == self.FOCUS_SUBMENU:
-                self.focus_level = self.FOCUS_CONTENT
-            elif self.focus_level == self.FOCUS_TABBAR:
+            if top:
+                getattr(self, top.close)()
+            elif self.focus_level != self.FOCUS_CONTENT:
                 self.focus_level = self.FOCUS_CONTENT
             elif self.view == self.VIEW_EPISODES:
                 self.view = self.VIEW_PODCASTS
             return True
 
-        # ── Capture modes ──
-        if self.searching:
-            return self._handle_search_key(key)
-        if self.discover_searching:
-            self._handle_discover_key(key)
-            return True
-
-        # ── Overlay captures ──
-        if self.show_sleep_menu:
-            options = self._sleep_options()
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.sleep_cursor = (self.sleep_cursor + 1) % len(options)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.sleep_cursor = (self.sleep_cursor - 1) % len(options)
-            elif key in (curses.KEY_ENTER, 10, 13):
-                _, mins = options[self.sleep_cursor]
-                if mins == -1:
-                    self.sleep_timer_end = 0
-                    self.status("Sleep timer cancelled.")
-                elif mins == 0:
-                    pass  # not used anymore
-                else:
-                    self.sleep_timer_end = time.time() + mins * 60
-                    self.status(f"Sleep timer set: {mins} min")
-                self.show_sleep_menu = False
-            elif key in (27, ord("z")):
-                self.show_sleep_menu = False
-            return True
-
-        if self.show_themes:
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.theme_cursor = (self.theme_cursor + 1) % len(self.THEMES)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.theme_cursor = (self.theme_cursor - 1) % len(self.THEMES)
-            elif key in (curses.KEY_ENTER, 10, 13):
-                self.current_theme = self.theme_cursor
-                self._apply_theme(self.current_theme)
-                self.show_themes   = False
-                self.status(f"Theme: {self.THEMES[self.current_theme]['name']}")
-            return True
-
-        if self.show_desc:
-            if key in (curses.KEY_DOWN, ord("j")):   self.desc_offset += 1
-            elif key in (curses.KEY_UP, ord("k")):   self.desc_offset = max(0, self.desc_offset - 1)
-            elif key in (ord("d"), ord("q")):         self.show_desc = False
-            return True
-
-        if self.unsub_confirm:
-            if key in (ord("y"), ord("Y")):  self._do_unsubscribe()
-            else:
-                self.unsub_confirm = False; self.unsub_target = None
-            return True
-
-        if self.del_file_step > 0:
-            if key in (ord("y"), ord("Y")):
-                if self.del_file_step == 1:
-                    f    = self.del_file_target
-                    dur  = int(f.get("duration", 0) or 0)
-                    pos  = int(f.get("playedUpTo", 0) or 0)
-                    stat = int(f.get("playingStatus", 0) or 0)
-                    if stat == 3 or (dur and pos >= dur - 30):
-                        self._do_delete_file()
-                    else:
-                        self.del_file_step = 2
-                else:
-                    self._do_delete_file()
-            else:
-                self.del_file_step = 0; self.del_file_target = None
+        # ── An open overlay takes every other key ──
+        if top:
+            getattr(self, top.key)(key)
             return True
 
         # ── Tab / Shift+Tab: cycle focus ──
-        KEY_TAB       = 9
-        KEY_SHIFT_TAB = 353
-
-        if key == KEY_TAB:
+        if key == 9:
             self._focus_next()
             return True
-        if key == KEY_SHIFT_TAB:
+        if key == curses.KEY_BTAB:
             self._focus_prev()
             return True
 
@@ -2406,7 +2986,7 @@ class PocketTUI:
                 self.tab_cursor = (self.tab_cursor + 1) % len(TABS)
             elif key in (curses.KEY_LEFT, ord("h")):
                 self.tab_cursor = (self.tab_cursor - 1) % len(TABS)
-            elif key in (curses.KEY_ENTER, 10, 13):
+            elif key in _ENTER:
                 self._activate_tab(self.tab_cursor)
             return True
 
@@ -2415,170 +2995,273 @@ class PocketTUI:
                 self.discover_mode_cursor = (self.discover_mode_cursor + 1) % len(DISCOVER_MODES)
             elif key in (curses.KEY_LEFT, ord("h")):
                 self.discover_mode_cursor = (self.discover_mode_cursor - 1) % len(DISCOVER_MODES)
-            elif key in (curses.KEY_ENTER, 10, 13):
+            elif key in _ENTER:
                 mode = DISCOVER_MODES[self.discover_mode_cursor][0]
                 self.discover_query = ""
                 self.load_discover_list(mode)
                 self.focus_level = self.FOCUS_CONTENT
             return True
 
-        # ── Global toggles ──
-        if key == ord("?"):
-            self.show_keys = not self.show_keys
-            return True
-        if key == ord("t"):
-            self.show_themes  = not self.show_themes
-            self.theme_cursor = self.current_theme
-            return True
-
-        # ── Number keys: jump to tab ──
-        for i, (k, _, _, _) in enumerate(TABS):
-            if key == ord(k):
-                self._activate_tab(i)
-                return True
-
-        # ── Search ──
-        if key == ord("/") and self.view in (self.VIEW_EPISODES, self.VIEW_PODCASTS):
-            self.searching          = True
-            self.search_query       = ""
-            self.search_results     = []
-            self.pod_search_results = []
-            self.search_cursor      = self.search_offset     = 0
-            self.pod_search_cursor  = self.pod_search_offset = 0
-            return True
-
-        if key == ord("/") and self.view == self.VIEW_DISCOVER:
-            self.discover_searching = True
-            return True
-
-        # ── Unsubscribe ──
-        if key == ord("u") and self.view == self.VIEW_PODCASTS and self.podcasts:
-            self.unsub_target  = self.podcasts[self.pod_cursor]
-            self.unsub_confirm = True
-            return True
-
-        # ── Player controls ──
-        if key in (ord("p"), ord(" ")):
-            if self.mpv.is_running():
-                self.mpv.pause_toggle()
-                if self.playing_pod and self.playing_ep:
-                    self._push_sync(self.mpv.get_position())
-                    self.last_sync = time.time()
-            elif self.playing_ep:
-                if self.playing_pod and self.playing_pod.get("uuid") == "__files__":
-                    self.play_file(self.playing_ep)
-                else:
-                    self.play(self.playing_pod or {"uuid": "", "title": ""}, self.playing_ep)
-            return True
-
-        if key == curses.KEY_RIGHT and self.mpv.is_running():
-            self.mpv.seek(30); return True
-        if key == curses.KEY_LEFT and self.mpv.is_running():
-            self.mpv.seek(-30); return True
-        if key == ord("n") and self.mpv.is_running():
-            self.mpv.next_chapter(); return True
-        if key == ord("N") and self.mpv.is_running():
-            self.mpv.prev_chapter(); return True
-        if key == ord("]") and self.mpv.is_running():
-            self.speed_idx = min(len(SPEEDS) - 1, self.speed_idx + 1)
-            self.mpv.set_speed(SPEEDS[self.speed_idx])
-            self.status(f"Speed: {SPEEDS[self.speed_idx]}x")
-            return True
-        if key == ord("[") and self.mpv.is_running():
-            self.speed_idx = max(0, self.speed_idx - 1)
-            self.mpv.set_speed(SPEEDS[self.speed_idx])
-            self.status(f"Speed: {SPEEDS[self.speed_idx]}x")
-            return True
-        if key == ord("z"):
-            self.show_sleep_menu = not self.show_sleep_menu
-            if self.show_sleep_menu:
-                self.sleep_cursor = 0
-            return True
-
-        if key == ord("S") and self.playing_ep:
-            self.skip_silence = (self.skip_silence + 1) % 4
-            labels = ["off", "normal", "medium", "aggressive"]
-            self.status(f"Skip silence: {labels[self.skip_silence]} (applies on next play)")
-            return True
-
-        # ── View-specific navigation ──
-        if self.view == self.VIEW_PODCASTS:
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.pod_cursor, self.pod_offset = self._scroll(self.pod_cursor, self.pod_offset,  1, len(self.podcasts), vis)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.pod_cursor, self.pod_offset = self._scroll(self.pod_cursor, self.pod_offset, -1, len(self.podcasts), vis)
-            elif key == curses.KEY_NPAGE:
-                self.pod_cursor, self.pod_offset = self._scroll(self.pod_cursor, self.pod_offset,  vis, len(self.podcasts), vis)
-            elif key == curses.KEY_PPAGE:
-                self.pod_cursor, self.pod_offset = self._scroll(self.pod_cursor, self.pod_offset, -vis, len(self.podcasts), vis)
-            elif key in (curses.KEY_ENTER, 10, 13) and self.podcasts:
-                self.load_episodes(self.podcasts[self.pod_cursor])
-
-        elif self.view == self.VIEW_EPISODES:
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.ep_cursor, self.ep_offset = self._scroll(self.ep_cursor, self.ep_offset,  1, len(self.episodes), vis)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.ep_cursor, self.ep_offset = self._scroll(self.ep_cursor, self.ep_offset, -1, len(self.episodes), vis)
-            elif key == curses.KEY_NPAGE:
-                self.ep_cursor, self.ep_offset = self._scroll(self.ep_cursor, self.ep_offset,  vis, len(self.episodes), vis)
-            elif key == curses.KEY_PPAGE:
-                self.ep_cursor, self.ep_offset = self._scroll(self.ep_cursor, self.ep_offset, -vis, len(self.episodes), vis)
-            elif key in (curses.KEY_ENTER, 10, 13) and self.episodes:
-                self.play(self.current_pod, self.episodes[self.ep_cursor])
-            elif key in (curses.KEY_BACKSPACE, 127, ord("b")):
-                self.view = self.VIEW_PODCASTS
-            elif key == ord("d"):
-                self.show_desc = True; self.desc_offset = 0
-
-        elif self.view == self.VIEW_QUEUE:
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.q_cursor, self.q_offset = self._scroll(self.q_cursor, self.q_offset,  1, len(self.queue_items), vis)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.q_cursor, self.q_offset = self._scroll(self.q_cursor, self.q_offset, -1, len(self.queue_items), vis)
-            elif key == curses.KEY_NPAGE:
-                self.q_cursor, self.q_offset = self._scroll(self.q_cursor, self.q_offset,  vis, len(self.queue_items), vis)
-            elif key == curses.KEY_PPAGE:
-                self.q_cursor, self.q_offset = self._scroll(self.q_cursor, self.q_offset, -vis, len(self.queue_items), vis)
-            elif key in (curses.KEY_ENTER, 10, 13) and self.queue_items:
-                ep       = self.queue_items[self.q_cursor]
-                pod_uuid = ep.get("podcastUuid") or ep.get("podcast_uuid") or ep.get("podcast")
-                self.play({"uuid": pod_uuid, "title": ep.get("podcastTitle", "")}, ep)
-            elif key == ord("d"):
-                self.show_desc = True; self.desc_offset = 0
-
-        elif self.view == self.VIEW_FILES:
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.f_cursor, self.f_offset = self._scroll(self.f_cursor, self.f_offset,  1, len(self.files_items), vis)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.f_cursor, self.f_offset = self._scroll(self.f_cursor, self.f_offset, -1, len(self.files_items), vis)
-            elif key == curses.KEY_NPAGE:
-                self.f_cursor, self.f_offset = self._scroll(self.f_cursor, self.f_offset,  vis, len(self.files_items), vis)
-            elif key == curses.KEY_PPAGE:
-                self.f_cursor, self.f_offset = self._scroll(self.f_cursor, self.f_offset, -vis, len(self.files_items), vis)
-            elif key in (curses.KEY_ENTER, 10, 13) and self.files_items:
-                self.play_file(self.files_items[self.f_cursor])
-            elif key == ord("x") and self.files_items:
-                self.del_file_target = self.files_items[self.f_cursor]
-                self.del_file_step   = 1
-
-        elif self.view == self.VIEW_DISCOVER:
-            list_vis = self._visible_rows() - 2
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.discover_cursor, self.discover_offset = self._scroll(
-                    self.discover_cursor, self.discover_offset, 1, len(self.discover_results), list_vis)
-            elif key in (curses.KEY_UP, ord("k")):
-                self.discover_cursor, self.discover_offset = self._scroll(
-                    self.discover_cursor, self.discover_offset, -1, len(self.discover_results), list_vis)
-            elif key == curses.KEY_NPAGE:
-                self.discover_cursor, self.discover_offset = self._scroll(
-                    self.discover_cursor, self.discover_offset, list_vis, len(self.discover_results), list_vis)
-            elif key == curses.KEY_PPAGE:
-                self.discover_cursor, self.discover_offset = self._scroll(
-                    self.discover_cursor, self.discover_offset, -list_vis, len(self.discover_results), list_vis)
-            elif key in (curses.KEY_ENTER, 10, 13) and self.discover_results:
-                self._do_subscribe(self.discover_results[self.discover_cursor])
-
+        # ── Everything else comes from the key registry ──
+        self._dispatch(key)
         return True
+
+    def _dispatch(self, key):
+        """Run the registry action bound to key in the current view, if any."""
+        for row in KEYMAP:
+            if row.views is not None and self.view not in row.views:
+                continue
+            if row.needs == "mpv" and not self.mpv.is_running():
+                continue
+            for codes, action, arg in row.binds:
+                if key in codes:
+                    handler = getattr(self, f"_act_{action}")
+                    if arg is None:
+                        handler()
+                    else:
+                        handler(arg)
+                    return True
+        return False
+
+    # ── Registry actions: lists ──
+
+    def _nav_list(self):
+        """(items, cursor attribute, offset attribute, visible rows) of the current view."""
+        vis = max(1, self._visible_rows())
+        if self.view == self.VIEW_PODCASTS:
+            return self.podcasts, "pod_cursor", "pod_offset", vis
+        if self.view == self.VIEW_EPISODES:
+            return self.episodes, "ep_cursor", "ep_offset", vis
+        if self.view == self.VIEW_QUEUE:
+            return self.queue_items, "q_cursor", "q_offset", vis
+        if self.view == self.VIEW_FILES:
+            return self.files_items, "f_cursor", "f_offset", vis
+        return self.discover_results, "discover_cursor", "discover_offset", max(1, vis - 2)
+
+    def _move_cursor(self, delta):
+        items, cur, off, vis = self._nav_list()
+        c, o = self._scroll(getattr(self, cur), getattr(self, off), delta, len(items), vis)
+        setattr(self, cur, c)
+        setattr(self, off, o)
+
+    def _selected(self):
+        items, cur, _, _ = self._nav_list()
+        idx = getattr(self, cur)
+        return items[idx] if 0 <= idx < len(items) else None
+
+    def _act_move(self, delta):
+        self._move_cursor(delta)
+
+    def _act_page(self, direction):
+        self._move_cursor(direction * self._nav_list()[3])
+
+    def _act_edge(self, direction):
+        self._move_cursor(direction * max(1, len(self._nav_list()[0])))
+
+    def _act_tab(self, idx):
+        self._activate_tab(idx)
+
+    def _act_select(self):
+        item = self._selected()
+        if item is None:
+            return
+        if self.view == self.VIEW_PODCASTS:
+            self.load_episodes(item)
+        elif self.view == self.VIEW_EPISODES:
+            self.play(self.current_pod, item)
+        elif self.view == self.VIEW_QUEUE:
+            pod_uuid = item.get("podcastUuid") or item.get("podcast_uuid") or item.get("podcast")
+            self.play({"uuid": pod_uuid, "title": item.get("podcastTitle", "")}, item)
+        elif self.view == self.VIEW_FILES:
+            self.play_file(item)
+        elif self.view == self.VIEW_DISCOVER:
+            self._do_subscribe(item)
+
+    def _act_back(self):
+        self.view = self.VIEW_PODCASTS
+
+    def _act_search(self):
+        if self.view == self.VIEW_DISCOVER:
+            self.discover_searching = True
+            return
+        self.searching          = True
+        self.search_query       = ""
+        self.search_results     = []
+        self.pod_search_results = []
+        self.search_cursor      = self.search_offset     = 0
+        self.pod_search_cursor  = self.pod_search_offset = 0
+
+    def _act_describe(self):
+        if self._selected() is not None:
+            self.show_desc   = True
+            self.desc_offset = 0
+
+    def _act_unsubscribe(self):
+        pod = self._selected()
+        if pod is not None:
+            self.unsub_target  = pod
+            self.unsub_confirm = True
+
+    def _act_delete_file(self):
+        f = self._selected()
+        if f is not None:
+            self.del_file_target = f
+            self.del_file_step   = 1
+
+    # ── Registry actions: player ──
+
+    def _act_toggle_play(self):
+        if self.loading_stream:
+            return
+        if self.mpv.is_running():
+            self.mpv.pause_toggle()
+            if self.playing_pod and self.playing_ep:
+                pos = self.mpv.get_position()
+                self._remember_position(pos)
+                self._push_sync(pos)
+                self.last_sync = time.time()
+        elif self.playing_ep:
+            if self.playing_pod and self.playing_pod.get("uuid") == "__files__":
+                self.play_file(self.playing_ep)
+            else:
+                self.play(self.playing_pod or {"uuid": "", "title": ""}, self.playing_ep)
+
+    def _act_seek(self, secs):
+        self.mpv.seek(secs)
+
+    def _act_chapter(self, direction):
+        if direction > 0:
+            self.mpv.next_chapter()
+        else:
+            self.mpv.prev_chapter()
+
+    def _act_speed(self, direction):
+        self.speed_idx = max(0, min(len(SPEEDS) - 1, self.speed_idx + direction))
+        if self.mpv.is_running():
+            self.mpv.set_speed(SPEEDS[self.speed_idx])
+        self.status(f"Speed: {SPEEDS[self.speed_idx]}x")
+        self._save_prefs()
+
+    def _act_cycle_silence(self):
+        self.skip_silence = (self.skip_silence + 1) % 4
+        if self.mpv.is_running():
+            self.mpv.set_skip_silence(self.skip_silence)
+        labels = ["off", "normal", "medium", "aggressive"]
+        self.status(f"Skip silence: {labels[self.skip_silence]}")
+        self._save_prefs()
+
+    def _act_sleep_menu(self):
+        self.show_sleep_menu = True
+        self.sleep_cursor    = 0
+
+    # ── Registry actions: other ──
+
+    def _act_themes(self):
+        self.show_themes  = True
+        self.theme_cursor = self.current_theme
+
+    def _act_keys(self):
+        self.show_keys   = True
+        self.keys_offset = 0
+
+    def _save_prefs(self):
+        save_prefs(self.THEMES[self.current_theme]["name"], self.speed_idx, self.skip_silence)
+
+    # ── Overlay key handlers and closers ──
+
+    def _close_delete(self):
+        self.del_file_step   = 0
+        self.del_file_target = None
+
+    def _key_delete(self, key):
+        if key not in (ord("y"), ord("Y")):
+            self._close_delete()
+        elif self.del_file_step == 1:
+            f = self.del_file_target
+            if is_played(f):
+                self._do_delete_file()
+            else:
+                self.del_file_step = 2
+        else:
+            self._do_delete_file()
+
+    def _close_unsub(self):
+        self.unsub_confirm = False
+        self.unsub_target  = None
+
+    def _key_unsub(self, key):
+        if key in (ord("y"), ord("Y")):
+            self._do_unsubscribe()
+        else:
+            self._close_unsub()
+
+    def _close_sleep(self):
+        self.show_sleep_menu = False
+
+    def _key_sleep(self, key):
+        options = self._sleep_options()
+        if key in (curses.KEY_DOWN, ord("j")):
+            self.sleep_cursor = (self.sleep_cursor + 1) % len(options)
+        elif key in (curses.KEY_UP, ord("k")):
+            self.sleep_cursor = (self.sleep_cursor - 1) % len(options)
+        elif key in _ENTER:
+            _, mins = options[min(self.sleep_cursor, len(options) - 1)]
+            if mins == -1:
+                self.sleep_timer_end = 0
+                self.status("Sleep timer cancelled.")
+            else:
+                self.sleep_timer_end = time.time() + mins * 60
+                self.status(f"Sleep timer set: {mins} min")
+            self.show_sleep_menu = False
+        elif key == ord("z"):
+            self.show_sleep_menu = False
+
+    def _close_keys(self):
+        self.show_keys = False
+
+    def _key_keys(self, key):
+        if key == ord("?"):
+            self.show_keys = False
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.keys_offset += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            self.keys_offset = max(0, self.keys_offset - 1)
+        elif key == curses.KEY_NPAGE:
+            self.keys_offset += 10
+        elif key == curses.KEY_PPAGE:
+            self.keys_offset = max(0, self.keys_offset - 10)
+
+    def _close_themes(self):
+        self.show_themes = False
+
+    def _key_themes(self, key):
+        if key in (curses.KEY_DOWN, ord("j")):
+            self.theme_cursor = (self.theme_cursor + 1) % len(self.THEMES)
+        elif key in (curses.KEY_UP, ord("k")):
+            self.theme_cursor = (self.theme_cursor - 1) % len(self.THEMES)
+        elif key in _ENTER:
+            self.current_theme = self.theme_cursor
+            self._apply_theme(self.current_theme)
+            self.show_themes   = False
+            self.status(f"Theme: {self.THEMES[self.current_theme]['name']}")
+            self._save_prefs()
+        elif key == ord("t"):
+            self.show_themes = False
+
+    def _close_search(self):
+        self.searching    = False
+        self.search_query = ""
+
+    def _close_desc(self):
+        self.show_desc = False
+
+    def _key_desc(self, key):
+        if key in (curses.KEY_DOWN, ord("j")):
+            self.desc_offset += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            self.desc_offset = max(0, self.desc_offset - 1)
+        elif key == ord("d"):
+            self.show_desc = False
 
     def _has_submenu(self):
         """True if current view has a sub-menu level."""
@@ -2668,12 +3351,7 @@ class PocketTUI:
         if key in (curses.KEY_BACKSPACE, 127):
             self.discover_query = self.discover_query[:-1]
             self._update_discover_results()
-        elif key == 27:
-            self.discover_searching = False
-            if not self.discover_query:
-                m = self.discover_list_mode
-                self.discover_results = self.discover_lists.get(m, [])
-        elif key in (curses.KEY_ENTER, 10, 13):
+        elif key in _ENTER:
             if self.discover_results:
                 self._do_subscribe(self.discover_results[self.discover_cursor])
             self.discover_searching = False
@@ -2716,55 +3394,59 @@ class PocketTUI:
     # ─────────────────────────────────────────
 
     def _load_last_played(self):
-        """On startup, set playing_ep to the most recently played item."""
-        try:
-            in_prog  = self.api.in_progress()
-            last_ep  = in_prog[0] if in_prog else None
+        """On startup, set playing_ep to the most recently played item.
+        Runs in the background so the first screen appears right away."""
+        def _load():
+            try:
+                in_prog  = self.api.in_progress()
+                last_ep  = in_prog[0] if in_prog else None
 
-            files = self.api.files()
-            files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f.get('title', ''))])
-            self.files_items = files
+                files = self.api.files()
+                files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f.get('title', ''))])
+                self.files_items = files
 
-            with_progress = [f for f in files if (f.get("playedUpTo") or 0) > 5]
-            last_file = sorted(with_progress, key=lambda f: f.get("modifiedAt", ""), reverse=True)
-            last_file = last_file[0] if last_file else None
+                with_progress = [f for f in files if (f.get("playedUpTo") or 0) > 5]
+                last_file = sorted(with_progress, key=lambda f: f.get("modifiedAt", ""), reverse=True)
+                last_file = last_file[0] if last_file else None
 
-            def ts(x):
-                if not x:
+                def ts(x):
+                    if not x:
+                        return 0
+                    mod = x.get("modifiedAt") or x.get("playedUpToModified", "0")
+                    try:
+                        if mod and "T" in str(mod):
+                            return datetime.fromisoformat(mod.replace("Z", "+00:00")).timestamp()
+                        if mod and mod != "0":
+                            return int(mod) / 1000
+                    except Exception:
+                        pass
                     return 0
-                mod = x.get("modifiedAt") or x.get("playedUpToModified", "0")
-                try:
-                    if mod and "T" in str(mod):
-                        return datetime.fromisoformat(mod.replace("Z", "+00:00")).timestamp()
-                    if mod and mod != "0":
-                        return int(mod) / 1000
-                except Exception:
-                    pass
-                return 0
 
-            ep_ts   = ts(last_ep)
-            file_ts = ts(last_file)
+                ep_ts   = ts(last_ep)
+                file_ts = ts(last_file)
 
-            if last_ep and last_file:
-                recent = last_file if (ep_ts == 0 and file_ts > 0) or file_ts > ep_ts else last_ep
-            else:
-                recent = last_ep or last_file
+                if last_ep and last_file:
+                    recent = last_file if (ep_ts == 0 and file_ts > 0) or file_ts > ep_ts else last_ep
+                else:
+                    recent = last_ep or last_file
 
-            if not recent:
-                return
+                if not recent or self.playing_ep or self.loading_stream:
+                    return  # nothing to resume, or the user already started something
 
-            file_uuids = {f.get("uuid") for f in files}
-            if recent.get("uuid") in file_uuids:
-                self.playing_pod = {"uuid": "__files__", "title": "Files"}
-            else:
-                self.playing_pod = {
-                    "uuid":  recent.get("podcastUuid") or recent.get("podcast_uuid") or recent.get("podcast", ""),
-                    "title": recent.get("podcastTitle", ""),
-                }
-            self.playing_ep = recent
-            self.status(f"Last played: {recent.get('title', '')[:50]}")
-        except Exception as e:
-            self.status(f"Resume error: {e}", error=True)
+                file_uuids = {f.get("uuid") for f in files}
+                if recent.get("uuid") in file_uuids:
+                    self.playing_pod = {"uuid": "__files__", "title": "Files"}
+                else:
+                    self.playing_pod = {
+                        "uuid":  recent.get("podcastUuid") or recent.get("podcast_uuid") or recent.get("podcast", ""),
+                        "title": recent.get("podcastTitle", ""),
+                    }
+                self.playing_ep = recent
+                self.status(f"Last played: {recent.get('title', '')[:50]}")
+            except Exception as e:
+                self.status(f"Resume error: {e}", error=True)
+
+        threading.Thread(target=_load, daemon=True).start()
 
     # ─────────────────────────────────────────
     # Main loop
@@ -2775,6 +3457,7 @@ class PocketTUI:
         self._load_last_played()
 
         while True:
+            self.mpv.poll()
             self.draw()
             self.sync_position()
             self.check_finished()
@@ -2785,10 +3468,18 @@ class PocketTUI:
             if key != -1 and not self.handle_key(key):
                 break
 
-        # Final sync on exit
+        self.shutdown()
+
+    def shutdown(self):
+        """Final sync on exit. Waits for it, or the process would end first."""
+        self._play_gen += 1
         if self.mpv.is_running():
-            self._push_sync(self.mpv.get_position())
+            pos = self.mpv.get_position()
             self.mpv.quit()
+            self._push_sync(pos, wait=True)
+        else:
+            self.mpv.quit()
+        self._save_prefs()
 
 
 # ─────────────────────────────────────────────
@@ -2807,11 +3498,54 @@ def main(stdscr):
             print(f"Login error: {err}")
             sys.exit(1)
     api = API(token)
-    PocketTUI(stdscr, api).run()
+    tui = PocketTUI(stdscr, api)
+    try:
+        tui.run()
+    except KeyboardInterrupt:
+        tui.shutdown()
 
 
-if __name__ == "__main__":
+USAGE = f"""pocketcli {VERSION} - terminal client for Pocket Casts
+
+Usage: pocketcli [option]
+
+  (no option)   start the player
+  --keys        print the keymap as Markdown
+  --logout      forget the saved login
+  --version     print the version
+  --help        show this help
+"""
+
+
+def cli(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args:
+        opt = args[0]
+        if opt in ("--version", "-V"):
+            print(f"pocketcli {VERSION} ({BUILD})")
+        elif opt in ("--help", "-h"):
+            print(USAGE, end="")
+        elif opt == "--keys":
+            print(keymap_markdown())
+        elif opt == "--logout":
+            try:
+                CONFIG_FILE.unlink()
+                print("Logged out.")
+            except FileNotFoundError:
+                print("Not logged in.")
+        else:
+            print(f"pocketcli: unknown option {opt}\n\n{USAGE}", end="", file=sys.stderr)
+            return 2
+        return 0
+
+    # Without this curses waits a full second after Esc before reporting it
+    os.environ.setdefault("ESCDELAY", "25")
     try:
         curses.wrapper(main)
     except KeyboardInterrupt:
         pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
