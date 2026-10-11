@@ -59,7 +59,7 @@ paru -S pocketcli
 ### Arch Linux (manual)
 
 ```bash
-git clone https://github.com/foforivera/pocketcli
+git clone https://github.com/foforivera/pocketcli 2>/dev/null || git -C pocketcli pull
 cd pocketcli
 bash install-linux.sh
 ```
@@ -67,7 +67,7 @@ bash install-linux.sh
 ### macOS
 
 ```bash
-git clone https://github.com/foforivera/pocketcli
+git clone https://github.com/foforivera/pocketcli 2>/dev/null || git -C pocketcli pull
 cd pocketcli
 bash install-macos.sh
 ```
