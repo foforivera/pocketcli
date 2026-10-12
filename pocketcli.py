@@ -432,20 +432,18 @@ def _hex_to_256(hex_color):
 
 
 def _can_redefine_colors():
-    """Whether exact theme colors can be set by redefining palette entries.
+    """Whether exact theme colors may be set by redefining palette entries.
 
-    curses only reports what terminfo claims. Konsole advertises the ability
-    (as xterm-256color) but ignores the request, which left themes showing the
-    stock dark blues and greens of palette slots 16-24. POCKETCLI_TRUECOLOR=1
-    or =0 overrides the guess for other terminals."""
+    Off unless POCKETCLI_TRUECOLOR=1. curses only reports what terminfo
+    claims, and terminals that ignore the redefinition (OSC 4) claim it too:
+    Konsole and others answer as xterm-256color, and the colors then render as
+    the stock dark blues and greens of palette slots 16-24. Nothing can detect
+    that from inside the program, so the fixed 256-color palette is the default
+    and redefinition is the opt-in."""
     forced = os.environ.get("POCKETCLI_TRUECOLOR", "").strip().lower()
-    if forced in ("0", "no", "off", "false"):
+    if forced not in ("1", "yes", "on", "true"):
         return False
-    if not (curses.can_change_color() and curses.COLORS >= 256):
-        return False
-    if forced in ("1", "yes", "on", "true"):
-        return True
-    return "KONSOLE_VERSION" not in os.environ
+    return curses.can_change_color() and curses.COLORS >= 256
 
 
 def _hex_to_ansi(hex_color):
