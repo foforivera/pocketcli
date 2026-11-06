@@ -4,8 +4,8 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.11.1"
-BUILD   = "2026-10-08"
+VERSION = "1.11.2"
+BUILD   = "2026-11-06"
 
 import os
 import re
@@ -504,7 +504,60 @@ def fmt_date(iso):
     return iso[:10] if iso else ""
 
 
+# Text from feeds, the API and iTunes can carry terminal control sequences.
+# Escape sequences go first, whole; line breaks and tabs become one space;
+# any other control character and the bidi overrides that reorder text are
+# dropped. The box and bullet characters pocketcli draws are all printable.
+_ANSI_RE  = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]"          # CSI: colors, cursor moves
+                       r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC: titles, links
+                       r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"     # DCS, SOS, PM, APC
+                       r"|\x1b[ -/]*[0-~]?")                  # any other ESC
+_SPACE_RE = re.compile(r"[\t\n\r\v\f]+")
+_CTRL_RE  = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_text(text):
+    """Text that is safe to hand to curses: no control characters."""
+    if not text:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    if text.isprintable():
+        return text
+    text = _ANSI_RE.sub("", text)
+    text = _SPACE_RE.sub(" ", text)
+    return _CTRL_RE.sub("", text)
+
+
+class SafeScreen:
+    """A curses window whose text calls go through clean_text().
+
+    Every other attribute goes straight to the real window, so the rest of
+    the code uses it exactly like stdscr."""
+    __slots__ = ("_win",)
+
+    def __init__(self, win):
+        object.__setattr__(self, "_win", win)
+
+    def __getattr__(self, name):
+        return getattr(self._win, name)
+
+    @staticmethod
+    def _clean_args(args):
+        return tuple(clean_text(a) if isinstance(a, str) else a for a in args)
+
+    def addstr(self, *args):
+        return self._win.addstr(*self._clean_args(args))
+
+    def addnstr(self, *args):
+        return self._win.addnstr(*self._clean_args(args))
+
+    def insstr(self, *args):
+        return self._win.insstr(*self._clean_args(args))
+
+
 def trunc(text, n):
+    text = clean_text(text)
     if not text:
         return ""
     return text if len(text) <= n else text[:n - 1] + "…"
@@ -567,11 +620,17 @@ class API:
         r.raise_for_status()
         return r
 
+    @staticmethod
+    def _json(r):
+        """Body of a successful reply as JSON; {} when it has no body, as
+        POST /files answers after saving a position."""
+        return r.json() if r.content.strip() else {}
+
     def _post(self, path, data=None):
-        return self._check(self.client.post(f"{BASE_URL}{path}", json=data or {})).json()
+        return self._json(self._check(self.client.post(f"{BASE_URL}{path}", json=data or {})))
 
     def _get(self, path):
-        return self._check(self.client.get(f"{BASE_URL}{path}")).json()
+        return self._json(self._check(self.client.get(f"{BASE_URL}{path}")))
 
     def _itunes_search(self, term, entity="podcast", limit=15):
         """Search iTunes catalog. Returns raw results list."""
@@ -1527,7 +1586,7 @@ class PocketTUI:
     # 5=selection  6=header  7=error  8=subtitle/dim
 
     def __init__(self, stdscr, api):
-        self.scr = stdscr
+        self.scr = SafeScreen(stdscr)
         self.api = api
         self.mpv = MPV()
 
@@ -2590,6 +2649,12 @@ class PocketTUI:
         dur  = self.mpv.get_duration() if self.mpv.is_running() else 0
         paus = self.mpv.get_paused()   if self.mpv.is_running() else True
         spd  = SPEEDS[self.speed_idx]
+        if not self.mpv.is_running() and self.playing_ep:
+            # Waiting to resume: the saved position, so the percentage is real
+            pos = int(self.playing_ep.get("playedUpTo", 0) or 0)
+            dur = int(self.playing_ep.get("duration", 0) or 0)
+            if pos > dur:
+                dur = 0   # a duration shorter than the position is wrong
 
         ep_title  = self.playing_ep.get("title", "")  if self.playing_ep  else ""
         pod_title = self.playing_pod.get("title", "") if self.playing_pod else ""
@@ -2628,14 +2693,15 @@ class PocketTUI:
             saved = int(self.playing_ep.get("playedUpTo", 0) or 0)
             self.scr.attron(curses.color_pair(2) | curses.A_BOLD)
             try:
-                self.scr.addstr(top + 1, 0, f" ▶ {fmt_dur(saved)} / {fmt_dur(int(self.playing_ep.get('duration', 0) or 0))}")
+                line2 = f" ▶ {fmt_dur(saved)} / {fmt_dur(dur)}"
+                self.scr.addstr(top + 1, 0, line2)
             except Exception:
                 pass
             self.scr.attroff(curses.color_pair(2) | curses.A_BOLD)
             self.scr.attron(curses.color_pair(3))
             try:
                 hint = "  loading..." if self.loading_stream else "  press space to continue"
-                self.scr.addstr(top + 1, 18, hint)
+                self.scr.addstr(top + 1, max(18, len(line2) + 1), hint)
             except Exception:
                 pass
             self.scr.attroff(curses.color_pair(3))
@@ -3659,6 +3725,7 @@ class PocketTUI:
 
         while True:
             self.mpv.poll()
+            self._adopt_mpv_duration()
             self.draw()
             self.sync_position()
             self.check_finished()
@@ -3670,6 +3737,24 @@ class PocketTUI:
                 break
 
         self.shutdown()
+
+    def _adopt_mpv_duration(self):
+        """Keep the length mpv measured on the playing item.
+
+        Pocket Casts can hold a wrong duration for an uploaded file (an
+        audiobook of 13:37:31 listed as 13:37). Once mpv knows the real one,
+        the item and its Files row use it, so the paused line, the percentage
+        and the list stay right after playback stops."""
+        ep = self.playing_ep
+        if not ep or not self.mpv.is_running():
+            return
+        dur = int(self.mpv.get_duration() or 0)
+        if dur <= 0 or dur == int(ep.get("duration") or 0):
+            return
+        ep["duration"] = dur
+        for f in getattr(self, "files_items", None) or []:
+            if f.get("uuid") == ep.get("uuid"):
+                f["duration"] = dur
 
     def shutdown(self):
         """Final sync on exit. Waits for it, or the process would end first."""
@@ -3738,6 +3823,13 @@ def cli(argv=None):
             print(f"pocketcli: unknown option {opt}\n\n{USAGE}", end="", file=sys.stderr)
             return 2
         return 0
+
+    # The player needs a real terminal: piped or redirected, curses would
+    # write escape codes into a file or fail with a cryptic error
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("pocketcli: the player needs a terminal (stdin and stdout must be a TTY)",
+              file=sys.stderr)
+        return 1
 
     # Without this curses waits a full second after Esc before reporting it
     os.environ.setdefault("ESCDELAY", "25")

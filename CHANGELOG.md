@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.11.2] - 2026-11-06
+
+### Fixed
+- Titles, descriptions, chapters and search results from feeds could carry terminal control sequences and line breaks into the screen; they are now stripped before drawing
+- Starting the player with stdin or stdout redirected now stops with a clear message instead of a curses error
+- Saving the position of an uploaded file showed "Sync failed: Expecting value" even though Pocket Casts had saved it: that endpoint answers with an empty body
+- An uploaded file whose Pocket Casts duration is wrong (an audiobook of 13:37:31 listed as 13:37) now takes the length mpv measures; a duration shorter than the saved position is not shown
+- Before resuming, the player panel showed 0% completed; it now shows the saved progress, and the "press space" hint no longer overlaps long times
+
 ## [1.11.1] - 2026-10-08
 
 ### Added
