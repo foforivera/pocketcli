@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.11.3] - 2026-11-06
+
+### Added
+- Playing an episode records it in your Pocket Casts listening history, so it shows up on your other devices as the apps do
+- `/` in an episode list also searches episode descriptions
+- Speeds of 2.5x and 3.0x
+
+### Fixed
+- Descriptions showed HTML entities as text (`&amp;`, `&#8217;`, `&nbsp;`) and joined words across paragraphs
+- Titles with emoji or CJK characters pushed the right-hand column (podcast, progress, author) out of line
+- An uploaded file in Up Next took its length from the Up Next entry, which can be wrong, instead of from the Files list
+
 ## [1.11.2] - 2026-11-06
 
 ### Fixed

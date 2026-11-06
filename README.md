@@ -28,11 +28,11 @@ Built with Python and `curses`. No Electron. No browser. Just a terminal.
 - **Episode status** — ● played, ◐ in progress, ○ not played
 - **Chapter support** — displays current chapter name, jump with `n` / `N`
 - **Skip silence** — 3 levels (normal / medium / aggressive), applied right away while playing
-- **Speed control** — 0.5x to 2.0x without pitch change
+- **Speed control** — 0.5x to 3.0x without pitch change
 - **Remembers your settings**: theme, speed and skip silence are kept between runs
 - **Files support** — audiobooks and custom uploads with progress tracking
 - **Episode descriptions** — press `d` to read the episode description with chapter breakdown
-- **Search** — press `/` to search episodes or discover new podcasts via iTunes
+- **Search** — press `/` to search episodes (titles and descriptions) or discover new podcasts via iTunes
 - **20 built-in themes** — press `t` to switch; list items use the theme's colors throughout
 - **Truecolor support** — exact hex colors on compatible terminals, ANSI fallback otherwise
 - **Keymap overlay** — press `?` to see all keybindings (scrolls on small terminals)

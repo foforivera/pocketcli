@@ -4,7 +4,7 @@ pocketcli - Terminal client for Pocket Casts
 Browse podcasts, play episodes, sync progress bidirectionally.
 """
 
-VERSION = "1.11.2"
+VERSION = "1.11.3"
 BUILD   = "2026-11-06"
 
 import os
@@ -19,6 +19,8 @@ import subprocess
 import configparser
 import threading
 import random
+import html
+import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -78,7 +80,7 @@ DISCOVER_MODES = [
     ("featured", "Featured"),
 ]
 
-SPEEDS      = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+SPEEDS      = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
 
 SILENCE_FILTERS = {
     0: None,
@@ -556,11 +558,67 @@ class SafeScreen:
         return self._win.insstr(*self._clean_args(args))
 
 
+def _char_width(ch):
+    """Terminal columns one character takes: 0, 1 or 2."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(text):
+    """Columns a string takes in the terminal. Emoji and CJK count two, a
+    combining mark or joiner none, and an emoji selector (U+FE0F) widens
+    the character before it to two, as terminals draw it."""
+    if not text:
+        return 0
+    if text.isascii():
+        return len(text)
+    total = prev = 0
+    for ch in text:
+        if ch == "\ufe0f" and prev == 1:
+            total += 1
+            prev = 2
+            continue
+        prev = _char_width(ch)
+        total += prev
+    return total
+
+
 def trunc(text, n):
+    """Text cut to fit n terminal columns, with … when something was cut."""
     text = clean_text(text)
+    if not text or n <= 0:
+        return ""
+    if text_width(text) <= n:
+        return text
+    out, used = [], 0
+    for ch in text:
+        cw = text_width(ch) if ch != "\ufe0f" else 0
+        if used + cw > n - 1:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out) + "…"
+
+
+def pad(text, n):
+    """Text padded with spaces to fill n terminal columns."""
+    return text + " " * max(0, n - text_width(text))
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def html_to_text(text):
+    """Plain text from an HTML description: tags become spaces, entities
+    (&amp; &#8217; &nbsp;) become their characters, runs of spaces collapse.
+    Escaped tags (&lt;p&gt;) are removed too once unescaped."""
     if not text:
         return ""
-    return text if len(text) <= n else text[:n - 1] + "…"
+    text = _TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = _TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
 
 
 # ─────────────────────────────────────────────
@@ -726,7 +784,7 @@ class API:
                     item.findtext("itunes:summary", "", ns) or
                     item.findtext("description", "") or ""
                 ).strip()
-                desc = re.sub(r"<[^>]+>", "", desc_raw).strip()
+                desc = html_to_text(desc_raw)
 
                 ep = {
                     "title":         title,
@@ -924,6 +982,21 @@ class API:
             return "nothing to add"
         try:
             self._post(f"/up_next/play_{where}", {"version": 2, "episode": payload})
+        except Exception as e:
+            return self._err(e)
+        return None
+
+    def history_add(self, payload):
+        """Record a play in the listening history, as the apps do when an
+        episode starts. payload is what up_next_episode() returns."""
+        if not payload:
+            return "nothing to record"
+        data = {"action": 1, "podcast": payload["podcast"], "episode": payload["uuid"],
+                "title": payload["title"], "url": payload["url"]}
+        if payload.get("published"):
+            data["published"] = payload["published"]
+        try:
+            self._post("/history/do", data)
         except Exception as e:
             return self._err(e)
         return None
@@ -1791,9 +1864,13 @@ class PocketTUI:
                             ep["file"]         = files.get(ep.get("uuid")) or {
                                 "uuid": ep.get("uuid"), "title": ep.get("title", "")}
                             ep["podcastTitle"] = "Files"
-                            for k in ("duration", "playedUpTo", "playingStatus"):
+                            for k in ("playedUpTo", "playingStatus"):
                                 if k in ep["file"]:
                                     ep.setdefault(k, ep["file"][k])
+                            # The Up Next entry can carry a wrong length for
+                            # a file; the Files list has the real one
+                            if int(ep["file"].get("duration") or 0) > 0:
+                                ep["duration"] = ep["file"]["duration"]
                         else:
                             ep.setdefault("podcastTitle", titles.get(ep.get("podcast"), ""))
                 else:
@@ -1961,11 +2038,14 @@ class PocketTUI:
                 missing = ", ".join(k for k, v in have.items() if not v) or "a valid id"
                 self.status(f"Playing. Not sent to Up Next: no {missing}")
             return
-        err = self.api.up_next_add("now", payload)
+        err  = self.api.up_next_add("now", payload)
+        herr = self.api.history_add(payload)
         if gen != self._play_gen:
             return
         if err:
             self.status(f"Up Next failed: {err}", error=True)
+        elif herr:
+            self.status(f"History not updated: {herr}", error=True)
         elif self._ctx() == "upnext":
             self.load_queue(keep_cursor=True)
 
@@ -2119,7 +2199,8 @@ class PocketTUI:
         q = self.search_query.lower().strip()
         if self.view == self.VIEW_EPISODES:
             self.search_results = [
-                ep for ep in self.episodes if q in ep.get("title", "").lower()
+                ep for ep in self.episodes
+                if q in ep.get("title", "").lower() or q in (ep.get("description") or "").lower()
             ] if q else []
             self.search_cursor = self.search_offset = 0
         elif self.view == self.VIEW_PODCASTS:
@@ -2438,10 +2519,10 @@ class PocketTUI:
             sel = idx == cursor
 
             left, right = fmt(idx, item)
-            right_w = len(right)
+            right_w = text_width(right)
             left_w  = w - right_w - 3
             left    = trunc(left, left_w)
-            line    = f" {left:<{left_w}} {right} "
+            line    = f" {pad(left, left_w)} {right} "
 
             try:
                 if sel:
@@ -2451,7 +2532,7 @@ class PocketTUI:
                 else:
                     # Left text: use theme fg (pair 8)
                     self.scr.attron(curses.color_pair(8))
-                    self.scr.addstr(y, 0, f" {left:<{left_w}} ")
+                    self.scr.addstr(y, 0, f" {pad(left, left_w)} ")
                     self.scr.attroff(curses.color_pair(8))
                     # Right text: use theme info/yellow (pair 3) - dates, durations
                     if right:
@@ -2607,7 +2688,7 @@ class PocketTUI:
             col_ind   = curses.color_pair(2) if already else curses.color_pair(1)
             title     = trunc(pod.get("title", ""), w - 24)
             author    = trunc(pod.get("author", ""), 18)
-            line      = f"  {indicator} {title:<{w - 26}} {author}"
+            line      = f"  {indicator} {pad(title, w - 26)} {author}"
             try:
                 if sel:
                     self.scr.attron(curses.A_REVERSE | curses.A_BOLD)
@@ -2621,7 +2702,7 @@ class PocketTUI:
                     # Author in info color
                     self.scr.attron(curses.color_pair(3))
                     try:
-                        self.scr.addstr(list_top + i, w - len(author) - 1, author)
+                        self.scr.addstr(list_top + i, w - text_width(author) - 1, author)
                     except Exception:
                         pass
                     self.scr.attroff(curses.color_pair(3))
@@ -2936,8 +3017,7 @@ class PocketTUI:
 
         self._overlay_box(oy, ox, oh, ow, title=trunc(ep.get("title", ""), ow - 6))
 
-        desc = ep.get("description", "No description available.")
-        desc = re.sub(r"<[^>]+>", "", desc)
+        desc = html_to_text(ep.get("description") or "No description available.")
         desc = re.sub(r"https?://\S+", "", desc)
         desc = re.sub(r"\s+", " ", desc).strip()
 
@@ -2956,7 +3036,7 @@ class PocketTUI:
                 lines.append(f"▶ {timestamps[i - 1].strip('()')}")
             for word in part.split():
                 if lines and not lines[-1].startswith("─") and not lines[-1].startswith("▶"):
-                    if len(lines[-1]) + len(word) + 1 <= ow - 4:
+                    if text_width(lines[-1]) + text_width(word) + 1 <= ow - 4:
                         lines[-1] += f" {word}"
                         continue
                 lines.append(word)
