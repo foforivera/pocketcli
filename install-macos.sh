@@ -12,8 +12,17 @@ if ! command -v brew &>/dev/null; then
 fi
 echo "==> Installing dependencies..."
 brew install mpv
+# pocketcli needs Python 3.10+; the python3 that ships with macOS is older
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    echo "==> Python 3.10+ not found, installing it with Homebrew..."
+    brew install python
+    hash -r
+fi
 # Python deps via pip
-if command -v pip3 &>/dev/null; then
+if python3 -m pip --version &>/dev/null; then
+    python3 -m pip install httpx --break-system-packages 2>/dev/null || \
+    python3 -m pip install --user httpx
+elif command -v pip3 &>/dev/null; then
     pip3 install httpx rich click --break-system-packages 2>/dev/null || \
     pip3 install httpx rich click
 elif command -v pip &>/dev/null; then
